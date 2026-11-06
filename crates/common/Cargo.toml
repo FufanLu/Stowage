@@ -1,0 +1,17 @@
+[package]
+name = "stowage-common"
+description = "Shared types for Stowage: environment traits (clock, rng, disk, transport), HLC, errors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

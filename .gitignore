@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.DS_Store
+/node_modules
+web/**/node_modules
+web/**/dist
+/data
+*.profraw
+/fuzz/artifacts
+/fuzz/corpus
