@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9b92a71e47087afd341b750258208abde14fba309de868ac76005ccd1162d4fe # shrinks to actions = [Put(368, 1123), Put(309, 736), Put(337, 565), Put(282, 1010), Put(20, 1428), Put(5, 1399), Put(225, 1135), Put(247, 1393), Put(146, 335), Put(86, 973), Put(219, 1061), Put(32, 241), Put(162, 294), Put(107, 212), Put(119, 205), Put(132, 810), Put(17, 1003), Put(4, 876), Put(56, 842), Put(39, 1113), Put(44, 325), Reopen, Delete(32), Put(33, 148), Reopen, Delete(74), Put(322, 1368), Put(343, 855), Put(178, 265), Put(132, 155), Put(142, 319), Put(333, 393), Put(203, 1274), Reopen, Put(215, 1380), Put(8, 505), Delete(159), Put(31, 305), Put(181, 620), Put(343, 1109), Put(102, 628), Checkpoint, Delete(246), Put(252, 1315), Put(75, 654), Put(394, 1205), Checkpoint, Put(279, 490), Put(63, 1118), Put(276, 1406), Delete(353), Put(163, 160), Put(96, 1217), Put(247, 184), Delete(139), Put(101, 1222), Reopen, Put(173, 1435), Put(158, 870)]

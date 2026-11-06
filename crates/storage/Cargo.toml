@@ -1,0 +1,29 @@
+[package]
+name = "stowage-storage"
+description = "Stowage storage engine: B+Tree, buffer pool, WAL with full-page writes, crash recovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# fjall-backed LSM engine, used only to compare against the B+Tree in benchmarks.
+lsm = ["dep:fjall"]
+
+[dependencies]
+stowage-common.workspace = true
+crc32c.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+fjall = { workspace = true, optional = true }
+
+[dev-dependencies]
+stowage-sim.workspace = true
+proptest.workspace = true
+anyhow.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

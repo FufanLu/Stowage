@@ -50,8 +50,8 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | Milestone | Scope | State |
 |---|---|---|
 | M0 | workspace, CI, environment traits, HLC, deterministic simulator | ✅ |
-| M1 | B+Tree, buffer pool, WAL, recovery | ⏳ |
-| M2 | Raft (pre-vote, leases, snapshots, membership change) | |
+| M1 | B+Tree, buffer pool, WAL, recovery | ✅ |
+| M2 | Raft (pre-vote, leases, snapshots, membership change) | ⏳ |
 | M3 | Multi-Raft, range split/merge, placement driver | |
 | M4 | distributed transactions, SI / SSI | |
 | M5 | SQL engine + Postgres wire protocol | |
@@ -60,6 +60,21 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | M8 | ops console, Helm | |
 | M9 | benchmarks, chaos, compatibility runs | |
 
+### Storage engine at a glance (M1)
+
+500 000 random keys, single thread, M3 Pro ([full results](docs/benchmarks.md),
+[how to read them](docs/illustrated/02-crash-and-recover.md#25-what-durability-costs)):
+
+| | Stowage B+Tree | LSM baseline (fjall) |
+|---|---:|---:|
+| point get (32 MiB cache) | **189 k ops/s** | 139 k ops/s |
+| 100-key range scan | **58 k ops/s** | 14 k ops/s |
+| random insert | 76 k ops/s | **239 k ops/s** |
+| space / user data | **1.40×** | 2.16× |
+
+Crash safety: 2 700 simulated power cuts with torn writes and 200 real `kill -9`s,
+with 0 lost acknowledged writes and 0 half-applied batches.
+
 ## Quick start
 
 ```bash
@@ -67,6 +82,8 @@ make check                                   # fmt + clippy + tests + cargo-deny
 make sim N=500                               # 500 fresh random simulation seeds
 STOWAGE_SIM_SEED=42 cargo nextest run -p stowage-sim   # replay one seed
 make trace SEED=42                           # print a real simulation trace
+cargo run --release -p stowage-storage --example crashtest -- loop --iterations 200
+cargo run --release -p stow-bench -- engine --keys 500000
 cargo run -p stowd -- --data-dir /tmp/stowage/n1
 ```
 
@@ -78,3 +95,4 @@ automatically), plus `cargo-nextest` and `cargo-deny`.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Illustrated chapters](docs/illustrated/README.md): one request at a time, real data only
 - [Architecture decision records](docs/adr/README.md)
+- [Benchmarks](docs/benchmarks.md)

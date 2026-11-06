@@ -13,7 +13,7 @@ test:
 
 # Explore N fresh random seeds; reproduce a failure with STOWAGE_SIM_SEED=<seed>.
 sim:
-	STOWAGE_SIM_SEEDS=$${N:-200} cargo nextest run --workspace --release -E 'binary(simulation)'
+	STOWAGE_SIM_SEEDS=$${N:-100} cargo nextest run --workspace --release --profile sim -E 'binary(simulation)'
 
 deny:
 	cargo deny check

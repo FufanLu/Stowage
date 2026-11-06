@@ -161,7 +161,7 @@ How seeds are chosen:
 | Variable | Effect |
 |---|---|
 | *(none)* | each test's fixed seed list |
-| `STOWAGE_SIM_SEEDS=200` | fixed seeds + 200 fresh random ones (CI `simulation` job) |
+| `STOWAGE_SIM_SEEDS=100` | fixed seeds + 100 fresh random ones (CI `simulation` job) |
 | `STOWAGE_SIM_SEED=42` | exactly seed 42 (reproduce a failure) |
 
 ## A.4 One write through a power loss
@@ -213,15 +213,16 @@ torn after 2 sector(s) (1024 bytes): 100
 torn after 3 sector(s) (1536 bytes): 71
 ```
 
-A torn prefix is the reason the WAL in M1 has a CRC32C per record and stops replay
-at the first record that fails its checksum. Chapter 02 will crash a real WAL in this
-mode and show recovery discarding exactly the torn tail.
+A torn prefix is the reason the WAL has a CRC32C per record and stops replay at the
+first record that fails its checksum. [Chapter 02](02-crash-and-recover.md) crashes
+the real engine in this mode and shows recovery discarding the torn tail and
+rebuilding torn pages.
 
 ## A.5 Where this goes next
 
 | Milestone | Runs inside the simulator |
 |---|---|
-| M1 | B+Tree + WAL under `CrashMode::Torn`, recovery checked after every crash |
+| M1 ✅ | B+Tree + WAL under `CrashMode::Torn`: 2 700 crashes, recovery checked after each ([chapter 02](02-crash-and-recover.md#26-how-this-is-tested)) |
 | M2 | Raft groups under loss, partitions and crashes; a linearizability checker over the client history |
 | M3 | range splits and rebalancing with nodes failing mid-move |
 | M4 | bank-transfer transactions; Elle-style cycle detection for SI / SSI anomalies |

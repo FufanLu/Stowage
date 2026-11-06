@@ -43,7 +43,7 @@ the first protocol line is written.
    the same seed produces the same fingerprint, which catches accidental
    non-determinism (a `HashMap` iteration, a stray `SystemTime::now()`).
 5. **Seed protocol.** Each test runs a fixed seed list. `STOWAGE_SIM_SEEDS=N` adds N
-   random seeds; CI's `simulation` job runs 200 per push. `STOWAGE_SIM_SEED=n` runs
+   random seeds; CI's `simulation` job runs 100 per push. `STOWAGE_SIM_SEED=n` runs
    exactly one seed. On failure, `for_each_seed` prints the reproducing command.
 6. **Naming convention.** Simulation tests live in `tests/simulation.rs` of their
    crate, so `nextest -E 'binary(simulation)'` selects them all.

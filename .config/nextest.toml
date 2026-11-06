@@ -1,0 +1,12 @@
+# A test that hangs is almost always a latch deadlock: fail it instead of waiting.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 5 }
+failure-output = "immediate-final"
+
+# Simulation sweeps run many seeds inside one test, so they are slow by design.
+[profile.sim]
+slow-timeout = { period = "120s", terminate-after = 10 }
+failure-output = "immediate-final"

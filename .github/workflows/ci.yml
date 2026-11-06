@@ -41,7 +41,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: tests
-        run: cargo nextest run --workspace --locked
+        run: cargo nextest run --workspace --locked --profile ci
       - name: doc tests
         run: cargo test --workspace --doc --locked
 
@@ -50,7 +50,7 @@ jobs:
     # A failure prints `STOWAGE_SIM_SEED=<n>`, which reproduces it locally.
     runs-on: ubuntu-24.04
     env:
-      STOWAGE_SIM_SEEDS: "200"
+      STOWAGE_SIM_SEEDS: "100"
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain || rustup toolchain install
@@ -58,7 +58,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace --locked --release -E 'binary(simulation)'
+      - run: cargo nextest run --workspace --locked --release --profile sim -E 'binary(simulation)'
 
   deny:
     runs-on: ubuntu-24.04

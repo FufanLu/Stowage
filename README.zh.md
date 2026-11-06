@@ -43,8 +43,8 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M0 | workspace、CI、环境 trait、HLC、确定性仿真器 | ✅ |
-| M1 | B+Tree、buffer pool、WAL、恢复 | ⏳ |
-| M2 | Raft（pre-vote、lease、snapshot、成员变更） | |
+| M1 | B+Tree、buffer pool、WAL、恢复 | ✅ |
+| M2 | Raft（pre-vote、lease、snapshot、成员变更） | ⏳ |
 | M3 | Multi-Raft、range 分裂/合并、调度器 | |
 | M4 | 分布式事务、SI / SSI | |
 | M5 | SQL 引擎 + Postgres 协议 | |
@@ -53,6 +53,19 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | M8 | 运维控制台、Helm | |
 | M9 | 压测、混沌测试、兼容性验证 | |
 
+### 存储引擎一览（M1）
+
+50 万个随机 key，单线程，M3 Pro（[完整结果](docs/benchmarks.md)，[怎么解读](docs/illustrated/02-crash-and-recover.md#25-what-durability-costs)）：
+
+| | Stowage B+Tree | LSM 对照（fjall） |
+|---|---:|---:|
+| 点查（32 MiB 缓存） | **189 k ops/s** | 139 k ops/s |
+| 100 条范围扫描 | **58 k ops/s** | 14 k ops/s |
+| 随机写入 | 76 k ops/s | **239 k ops/s** |
+| 空间占用 / 用户数据 | **1.40×** | 2.16× |
+
+崩溃安全：2700 次带撕裂写的模拟断电、200 次真实 `kill -9`，已确认的写入 0 丢失，batch 0 次只应用一半。
+
 ## 快速开始
 
 ```bash
@@ -60,6 +73,8 @@ make check                                   # fmt + clippy + 测试 + cargo-den
 make sim N=500                               # 额外跑 500 个随机仿真种子
 STOWAGE_SIM_SEED=42 cargo nextest run -p stowage-sim   # 重放某个种子
 make trace SEED=42                           # 打印一段真实的仿真 trace
+cargo run --release -p stowage-storage --example crashtest -- loop --iterations 200
+cargo run --release -p stow-bench -- engine --keys 500000
 cargo run -p stowd -- --data-dir /tmp/stowage/n1
 ```
 
@@ -70,3 +85,4 @@ cargo run -p stowd -- --data-dir /tmp/stowage/n1
 - [架构](docs/ARCHITECTURE.md)
 - [图解章节](docs/illustrated/README.md)：每章跟踪一个请求，数据全部来自真实运行
 - [架构决策记录（ADR）](docs/adr/README.md)
+- [基准测试](docs/benchmarks.md)

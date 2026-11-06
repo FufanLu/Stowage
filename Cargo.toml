@@ -13,8 +13,14 @@ publish = false
 [workspace.dependencies]
 stowage-common = { path = "crates/common" }
 stowage-sim = { path = "crates/sim" }
+stowage-storage = { path = "crates/storage" }
 
 anyhow = "1"
+crc32c = "0.6"
+fjall = "3"
+hdrhistogram = "7"
+parking_lot = { version = "0.13", features = ["arc_lock"] }
+proptest = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"

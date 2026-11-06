@@ -1,0 +1,18 @@
+[package]
+name = "stow-bench"
+description = "Stowage benchmarks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+stowage-common.workspace = true
+stowage-storage = { workspace = true, features = ["lsm"] }
+anyhow.workspace = true
+clap.workspace = true
+hdrhistogram.workspace = true
+
+[lints]
+workspace = true
