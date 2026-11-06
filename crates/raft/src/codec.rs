@@ -2,7 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::types::{Entry, EntryKind, HardState, Membership, NodeId, Snapshot, SnapshotMeta};
+use crate::types::{
+    Body, ConflictHint, Entry, EntryKind, HardState, Membership, Message, NodeId, Snapshot,
+    SnapshotMeta,
+};
 use crate::{Error, Result};
 
 /// `len u32 ‖ crc32c(payload) u32 ‖ payload`
@@ -173,6 +176,178 @@ pub fn decode_snapshot(buf: &[u8]) -> Result<Snapshot> {
     })
 }
 
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+/// Wire encoding of a Raft message.
+pub fn encode_message(m: &Message) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&m.from.to_le_bytes());
+    out.extend_from_slice(&m.to.to_le_bytes());
+    out.extend_from_slice(&m.term.to_le_bytes());
+    let u64s = |out: &mut Vec<u8>, xs: &[u64]| {
+        for x in xs {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    };
+    match &m.body {
+        Body::PreVote {
+            last_index,
+            last_term,
+        } => {
+            out.push(1);
+            u64s(&mut out, &[*last_index, *last_term]);
+        }
+        Body::PreVoteResp { granted } => {
+            out.push(2);
+            out.push(u8::from(*granted));
+        }
+        Body::Vote {
+            last_index,
+            last_term,
+            force,
+        } => {
+            out.push(3);
+            u64s(&mut out, &[*last_index, *last_term]);
+            out.push(u8::from(*force));
+        }
+        Body::VoteResp { granted } => {
+            out.push(4);
+            out.push(u8::from(*granted));
+        }
+        Body::Append {
+            prev_index,
+            prev_term,
+            entries,
+            commit,
+        } => {
+            out.push(5);
+            u64s(&mut out, &[*prev_index, *prev_term, *commit]);
+            out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            for e in entries {
+                put_bytes(&mut out, &encode_entry(e));
+            }
+        }
+        Body::AppendResp {
+            prev_index,
+            success,
+            match_index,
+            hint,
+        } => {
+            out.push(6);
+            u64s(&mut out, &[*prev_index, *match_index]);
+            out.push(u8::from(*success));
+            match hint {
+                None => out.push(0),
+                Some(h) => {
+                    out.push(1);
+                    out.push(u8::from(h.term.is_some()));
+                    u64s(&mut out, &[h.term.unwrap_or(0), h.first_index]);
+                }
+            }
+        }
+        Body::Heartbeat {
+            commit,
+            read_ctx,
+            round,
+        } => {
+            out.push(7);
+            u64s(&mut out, &[*commit, *read_ctx, *round]);
+        }
+        Body::HeartbeatResp { read_ctx, round } => {
+            out.push(8);
+            u64s(&mut out, &[*read_ctx, *round]);
+        }
+        Body::InstallSnapshot { snapshot } => {
+            out.push(9);
+            put_bytes(&mut out, &encode_snapshot(snapshot));
+        }
+        Body::TimeoutNow => out.push(10),
+    }
+    out
+}
+
+pub fn decode_message(buf: &[u8]) -> Result<Message> {
+    let mut r = Reader::new(buf);
+    let (from, to, term) = (r.u64()?, r.u64()?, r.u64()?);
+    let bool8 = |r: &mut Reader<'_>| -> Result<bool> { Ok(r.u8()? != 0) };
+    let body = match r.u8()? {
+        1 => Body::PreVote {
+            last_index: r.u64()?,
+            last_term: r.u64()?,
+        },
+        2 => Body::PreVoteResp {
+            granted: bool8(&mut r)?,
+        },
+        3 => Body::Vote {
+            last_index: r.u64()?,
+            last_term: r.u64()?,
+            force: bool8(&mut r)?,
+        },
+        4 => Body::VoteResp {
+            granted: bool8(&mut r)?,
+        },
+        5 => {
+            let (prev_index, prev_term, commit) = (r.u64()?, r.u64()?, r.u64()?);
+            let n = r.u32()?;
+            let mut entries = Vec::with_capacity(usize::try_from(n.min(1024)).unwrap_or(0));
+            for _ in 0..n {
+                entries.push(decode_entry(&r.bytes()?)?);
+            }
+            Body::Append {
+                prev_index,
+                prev_term,
+                entries,
+                commit,
+            }
+        }
+        6 => {
+            let (prev_index, match_index) = (r.u64()?, r.u64()?);
+            let success = bool8(&mut r)?;
+            let hint = match r.u8()? {
+                0 => None,
+                _ => {
+                    let has_term = bool8(&mut r)?;
+                    let (t, first_index) = (r.u64()?, r.u64()?);
+                    Some(ConflictHint {
+                        term: has_term.then_some(t),
+                        first_index,
+                    })
+                }
+            };
+            Body::AppendResp {
+                prev_index,
+                success,
+                match_index,
+                hint,
+            }
+        }
+        7 => Body::Heartbeat {
+            commit: r.u64()?,
+            read_ctx: r.u64()?,
+            round: r.u64()?,
+        },
+        8 => Body::HeartbeatResp {
+            read_ctx: r.u64()?,
+            round: r.u64()?,
+        },
+        9 => Body::InstallSnapshot {
+            snapshot: decode_snapshot(&r.bytes()?)?,
+        },
+        10 => Body::TimeoutNow,
+        k => return Err(Error::Storage(format!("message kind {k}"))),
+    };
+    r.done()?;
+    Ok(Message {
+        from,
+        to,
+        term,
+        body,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,7 +394,83 @@ mod tests {
         assert_eq!(decode_snapshot(&encode_snapshot(&s)).unwrap(), s);
     }
 
+    #[test]
+    fn messages_roundtrip() {
+        let e = Entry {
+            term: 2,
+            index: 7,
+            kind: EntryKind::Normal(b"x".to_vec()),
+        };
+        let snap = Snapshot {
+            meta: SnapshotMeta {
+                index: 5,
+                term: 5,
+                membership: Membership::new([1, 2, 3]),
+            },
+            data: b"state".to_vec(),
+        };
+        let bodies = vec![
+            Body::PreVote {
+                last_index: 3,
+                last_term: 1,
+            },
+            Body::PreVoteResp { granted: true },
+            Body::Vote {
+                last_index: 3,
+                last_term: 1,
+                force: true,
+            },
+            Body::VoteResp { granted: false },
+            Body::Append {
+                prev_index: 6,
+                prev_term: 2,
+                entries: vec![e.clone(), e],
+                commit: 4,
+            },
+            Body::AppendResp {
+                prev_index: 6,
+                success: false,
+                match_index: 0,
+                hint: Some(ConflictHint {
+                    term: Some(1),
+                    first_index: 3,
+                }),
+            },
+            Body::AppendResp {
+                prev_index: 6,
+                success: true,
+                match_index: 8,
+                hint: None,
+            },
+            Body::Heartbeat {
+                commit: 9,
+                read_ctx: 2,
+                round: 11,
+            },
+            Body::HeartbeatResp {
+                read_ctx: 2,
+                round: 11,
+            },
+            Body::InstallSnapshot { snapshot: snap },
+            Body::TimeoutNow,
+        ];
+        for body in bodies {
+            let m = Message {
+                from: 1,
+                to: 2,
+                term: 9,
+                body,
+            };
+            assert_eq!(decode_message(&encode_message(&m)).unwrap(), m);
+        }
+    }
+
     proptest! {
+        #[test]
+        fn message_decoder_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..300)) {
+            let _ = decode_message(&bytes);
+        }
+
         #[test]
         fn decoders_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..200)) {
             let _ = decode_entry(&bytes);

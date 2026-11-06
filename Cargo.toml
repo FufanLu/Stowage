@@ -15,6 +15,8 @@ stowage-common = { path = "crates/common" }
 stowage-sim = { path = "crates/sim" }
 stowage-storage = { path = "crates/storage" }
 stowage-raft = { path = "crates/raft" }
+stowage-kv = { path = "crates/kv" }
+stowage-node = { path = "crates/node" }
 
 anyhow = "1"
 crc32c = "0.6"
@@ -22,8 +24,9 @@ fjall = "3"
 hdrhistogram = "7"
 parking_lot = { version = "0.13", features = ["arc_lock"] }
 proptest = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tempfile = "3"
@@ -38,6 +41,14 @@ all = { level = "warn", priority = -1 }
 dbg_macro = "warn"
 todo = "warn"
 unwrap_used = "warn"
+
+# Simulation tests replay thousands of virtual seconds; unoptimized builds made
+# them 50× slower than release. opt-level 1 keeps debug info and fast compiles.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"

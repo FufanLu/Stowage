@@ -37,7 +37,7 @@ flowchart TB
     doc --> txn
     txn --> kv --> se
   end
-  pd["stow-pd ×3"] <-.-> kv
+  kv -.-> sched["scheduler<br/>(on range 1's leader)"]
 ```
 
 Stowage is deliberately **CP**: a write is acknowledged only once a Raft majority has
@@ -52,8 +52,8 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | M0 | workspace, CI, environment traits, HLC, deterministic simulator | ✅ |
 | M1 | B+Tree, buffer pool, WAL, recovery | ✅ |
 | M2 | Raft (pre-vote, leases, snapshots, membership change) | ✅ |
-| M3 | Multi-Raft, range split/merge, placement driver | ⏳ |
-| M4 | distributed transactions, SI / SSI | |
+| M3 | Multi-Raft: ranges, splits, rebalancing, shared Raft log, TCP cluster + Docker compose | ✅ |
+| M4 | distributed transactions, SI / SSI | ⏳ |
 | M5 | SQL engine + Postgres wire protocol | |
 | M6 | DynamoDB API, CDC, online schema change | |
 | M7 | security, backup / PITR, quotas, observability | |
@@ -81,6 +81,21 @@ A hand-written Raft, checked by a linearizability checker under partitions,
 crashes, message loss and leader churn, plus scripted scenarios such as the paper's
 Figure 8. Six classic Raft bugs were planted on purpose; the suite catches
 **6 / 6** ([chapter 03](docs/illustrated/03-one-write-through-raft.md#36-do-the-tests-actually-catch-raft-bugs)).
+
+### A cluster at a glance (M3)
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml up -d --build
+cargo run --release -p stowctl -- put hello world
+cargo run --release -p stowctl -- ranges
+```
+
+Ranges split automatically and move between nodes. The scheduler is not a
+separate service: it runs on whichever node leads range 1. On Linux in Docker
+Desktop, three nodes on one laptop do 1.7–2.5 k ops/s (50 % writes, 64 clients),
+and up to 4.9 k ops/s with 256 clients
+([chapter 04](docs/illustrated/04-a-range-splits.md),
+[benchmarks](docs/benchmarks.md#m3--three-node-cluster)).
 
 ## Quick start
 

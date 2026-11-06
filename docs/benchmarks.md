@@ -100,3 +100,49 @@ btree: height 3 · 10237 pages · 10170 leaf / 63 internal splits · WAL 1658.5 
 ```
 
 How these numbers are interpreted: [illustrated chapter 02 §2.5](illustrated/02-crash-and-recover.md#25-what-durability-costs).
+
+## M3 — three-node cluster
+
+`stow-bench kv` against three `stowd` processes. 100 000 keys of 100 B were
+pre-split into 12 ranges, with leaders spread 4/4/4 by the scheduler. Clients
+route by cached range leaders.
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml up -d --build
+docker compose -f deploy/compose/docker-compose.yml run --rm bench kv \
+  --peers 1=n1:7001,2=n2:7001,3=n3:7001 --keys 100000 --concurrency 64 --duration 20 --read-ratio 0.5 --presplit 12
+```
+
+### Linux in Docker Desktop (fdatasync), final commit
+
+```text
+loaded 100000 keys in 87.1 s (1149 writes/s)
+
+concurrency 64 · 100000 keys · value 100 B · read ratio 0.5 · 20 s
+| op    |   ops/s | p50 ms | p99 ms | p99.9 ms |
+|-------|--------:|-------:|-------:|---------:|
+| read  |     864 |  32.26 | 101.84 |   157.94 |
+| write |     867 |  32.72 | 110.49 |   155.45 |
+total 1731 ops/s · ambiguous writes 0 · errors 0
+
+concurrency 64 · read ratio 0.95
+| read  |    2096 |  29.00 |  85.79 |   165.41 |
+| write |     112 |  35.62 |  92.80 |   174.46 |
+total 2208 ops/s · ambiguous writes 0 · errors 0
+
+concurrency 256 · read ratio 0.5
+| read  |    2455 |  33.95 | 497.29 |  1207.96 |
+| write |    2466 |  34.18 | 416.28 |  1133.51 |
+total 4922 ops/s · ambiguous writes 107 · errors 0
+```
+
+### Design iterations measured on the way
+
+| Version | Environment | 64 clients, 50/50 |
+|---|---|---|
+| one Raft log file per range | macOS native | ≈60 writes/s while loading (election storms) |
+| one shared Raft log per node | macOS native (`F_FULLFSYNC`) | 742 ops/s, p50 89 ms |
+| shared log | Docker (fdatasync), earlier commit | 2 499 ops/s, p50 28 ms |
+| shared log + pipelined fsync (reverted) | Docker | 348 ops/s, p50 132 ms, 45 ambiguous |
+
+What each step changed: [illustrated chapter 04 §4.6](illustrated/04-a-range-splits.md#46-on-real-disks).

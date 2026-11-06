@@ -1,65 +1,98 @@
 //! `stowd` — a Stowage node.
 //!
-//! M0 only validates its environment: it opens the data directory through the same
-//! `Disk` trait the storage engine will use, and starts the node's hybrid logical
-//! clock. Later milestones add the storage engine, Raft, and the SQL / DynamoDB
-//! front ends behind this same entry point.
+//! ```text
+//! stowd --node-id 1 --listen 0.0.0.0:7001 \
+//!       --peers 1=n1:7001,2=n2:7001,3=n3:7001 --data-dir /data
+//! ```
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
-use stowage_common::os::{OsDisk, SystemClock};
-use stowage_common::{Disk as _, Hlc};
+use stowage_kv::StoreConfig;
+use stowage_node::{NodeConfig, parse_peers};
+use stowage_storage::BTreeOptions;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Stowage database node")]
 struct Args {
     /// Node id within the cluster (non-zero).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     node_id: u64,
 
+    /// Address to listen on for peers and clients.
+    #[arg(long)]
+    listen: SocketAddr,
+
+    /// Every node: `1=host:port,2=host:port,...` (including this one).
+    #[arg(long)]
+    peers: String,
+
     /// Data directory.
-    #[arg(long, default_value = "./data/n1")]
+    #[arg(long)]
     data_dir: PathBuf,
 
-    /// Maximum tolerated clock offset between nodes, in milliseconds.
-    #[arg(long, default_value_t = 500)]
-    max_offset_ms: u64,
+    /// Voters of range 1 when bootstrapping a new cluster (default: the first three peers).
+    #[arg(long)]
+    initial_replicas: Option<String>,
 
-    /// Log as JSON lines instead of human-readable text.
+    /// Split a range above this size, MiB.
+    #[arg(long, default_value_t = 64)]
+    split_mib: u64,
+
+    /// Storage engine cache, MiB.
+    #[arg(long, default_value_t = 64)]
+    cache_mib: u64,
+
+    /// Raft tick, milliseconds (elections time out after 10–20 ticks).
+    #[arg(long, default_value_t = 10)]
+    tick_ms: u64,
+
+    /// Log as JSON lines.
     #[arg(long)]
     log_json: bool,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    init_logging(args.log_json);
-
-    let disk = OsDisk::open(&args.data_dir)
-        .with_context(|| format!("opening data dir {}", args.data_dir.display()))?;
-    let files = disk.list().context("listing data dir")?;
-    let hlc = Hlc::new(Arc::new(SystemClock), args.max_offset_ms * 1_000_000);
-
-    tracing::info!(
-        node_id = args.node_id,
-        data_dir = %args.data_dir.display(),
-        files = files.len(),
-        hlc = %hlc.now(),
-        version = env!("CARGO_PKG_VERSION"),
-        "stowd environment ok (M0: no services yet)"
-    );
-    Ok(())
-}
-
-fn init_logging(json: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    if json {
+    if args.log_json {
         builder.json().init();
     } else {
         builder.init();
     }
+
+    let peers = parse_peers(&args.peers).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        peers.contains_key(&args.node_id),
+        "--peers must include this node ({})",
+        args.node_id
+    );
+    let mut store = StoreConfig::new(args.node_id, peers.keys().copied().collect());
+    if let Some(list) = &args.initial_replicas {
+        store.initial_replicas = list
+            .split(',')
+            .map(|s| s.trim().parse().context("bad --initial-replicas"))
+            .collect::<anyhow::Result<_>>()?;
+    }
+    store.split_bytes = args.split_mib << 20;
+    store.engine = BTreeOptions {
+        cache_pages: usize::try_from(args.cache_mib << 20 >> 13)?,
+        ..BTreeOptions::default()
+    };
+    tracing::info!(node = args.node_id, ?peers, data_dir = %args.data_dir.display(), "starting stowd");
+    stowage_node::run(NodeConfig {
+        store,
+        listen: args.listen,
+        peers,
+        data_dir: args.data_dir,
+        tick: Duration::from_millis(args.tick_ms),
+    })
+    .await
+    .context("node stopped")
 }

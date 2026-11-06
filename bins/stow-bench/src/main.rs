@@ -27,6 +27,36 @@ struct Cli {
 enum Cmd {
     /// Single-threaded storage-engine workloads on the real filesystem.
     Engine(EngineArgs),
+    /// Concurrent key-value workload against a running cluster.
+    Kv(KvArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct KvArgs {
+    #[arg(
+        long,
+        default_value = "1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003"
+    )]
+    peers: String,
+    #[arg(long, default_value_t = 100_000)]
+    keys: u64,
+    #[arg(long, default_value_t = 100)]
+    value_size: usize,
+    /// Concurrent requests in flight.
+    #[arg(long, default_value_t = 64)]
+    concurrency: usize,
+    /// Seconds of measured load.
+    #[arg(long, default_value_t = 20)]
+    duration: u64,
+    /// Fraction of operations that are reads.
+    #[arg(long, default_value_t = 0.5)]
+    read_ratio: f64,
+    /// Split the key space into this many ranges before loading.
+    #[arg(long, default_value_t = 12)]
+    presplit: u64,
+    /// Skip loading the keys (they are already there).
+    #[arg(long)]
+    no_load: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -236,5 +266,151 @@ fn engine_bench(a: &EngineArgs) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Engine(a) => engine_bench(&a),
+        Cmd::Kv(a) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(kv_bench(a)),
     }
+}
+
+#[derive(Default)]
+struct KvStats {
+    reads: Option<Histogram<u64>>,
+    writes: Option<Histogram<u64>>,
+    ambiguous: u64,
+    errors: u64,
+}
+
+async fn kv_bench(a: KvArgs) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let client = Arc::new(stowage_node::KvClient::new(
+        stowage_node::parse_peers(&a.peers).map_err(anyhow::Error::msg)?,
+    ));
+    let key = |i: u64| format!("user{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    if a.presplit > 1 {
+        // Keys are uniform hex: split at evenly spaced prefixes.
+        for i in 1..a.presplit {
+            let at = format!("user{:016x}", u64::MAX / a.presplit * i);
+            client.split(at.as_bytes()).await?;
+        }
+        println!(
+            "pre-split into {} ranges; waiting 5 s for the scheduler to spread leaders",
+            a.presplit
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    let value = vec![b'v'; a.value_size];
+    if !a.no_load {
+        let t = Instant::now();
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..a.concurrency {
+            let (client, next, value) = (client.clone(), next.clone(), value.clone());
+            let keys = a.keys;
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= keys {
+                        return;
+                    }
+                    let _ = client.put(key(i).as_bytes(), &value).await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await?;
+        }
+        println!(
+            "loaded {} keys in {:.1} s ({:.0} writes/s)",
+            a.keys,
+            t.elapsed().as_secs_f64(),
+            a.keys as f64 / t.elapsed().as_secs_f64()
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(a.duration);
+    let mut tasks = Vec::new();
+    for w in 0..a.concurrency {
+        let (client, value) = (client.clone(), value.clone());
+        let (keys, ratio) = (a.keys, a.read_ratio);
+        tasks.push(tokio::spawn(async move {
+            let mut rng = Xoshiro256::seeded(w as u64 + 1);
+            let mut st = KvStats {
+                reads: Some(Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).expect("hist")),
+                writes: Some(
+                    Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).expect("hist"),
+                ),
+                ..KvStats::default()
+            };
+            while Instant::now() < deadline {
+                let k = key(rng.gen_range(0, keys));
+                let t = Instant::now();
+                if rng.gen_bool(ratio) {
+                    match client.get(k.as_bytes()).await {
+                        Ok(_) => {
+                            let _ = st
+                                .reads
+                                .as_mut()
+                                .map(|h| h.record(t.elapsed().as_nanos() as u64));
+                        }
+                        Err(_) => st.errors += 1,
+                    }
+                } else {
+                    match client.put(k.as_bytes(), &value).await {
+                        Ok(()) => {
+                            let _ = st
+                                .writes
+                                .as_mut()
+                                .map(|h| h.record(t.elapsed().as_nanos() as u64));
+                        }
+                        Err(stowage_node::ClientError::Ambiguous) => st.ambiguous += 1,
+                        Err(_) => st.errors += 1,
+                    }
+                }
+            }
+            st
+        }));
+    }
+    let mut reads = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)?;
+    let mut writes = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)?;
+    let (mut ambiguous, mut errors) = (0, 0);
+    for t in tasks {
+        let st = t.await?;
+        if let Some(h) = st.reads {
+            reads.add(h)?;
+        }
+        if let Some(h) = st.writes {
+            writes.add(h)?;
+        }
+        ambiguous += st.ambiguous;
+        errors += st.errors;
+    }
+    let secs = a.duration as f64;
+    let q = |h: &Histogram<u64>, p: f64| h.value_at_quantile(p) as f64 / 1e6;
+    println!(
+        "\nconcurrency {} · {} keys · value {} B · read ratio {} · {} s",
+        a.concurrency, a.keys, a.value_size, a.read_ratio, a.duration
+    );
+    println!("| op    |   ops/s | p50 ms | p99 ms | p99.9 ms |");
+    println!("|-------|--------:|-------:|-------:|---------:|");
+    for (name, h) in [("read", &reads), ("write", &writes)] {
+        println!(
+            "| {name:<5} | {:>7.0} | {:>6.2} | {:>6.2} | {:>8.2} |",
+            h.len() as f64 / secs,
+            q(h, 0.5),
+            q(h, 0.99),
+            q(h, 0.999)
+        );
+    }
+    println!(
+        "total {:.0} ops/s · ambiguous writes {ambiguous} · errors {errors}",
+        (reads.len() + writes.len()) as f64 / secs
+    );
+    let ranges = client.ranges().await?;
+    let mut leaders = std::collections::BTreeMap::new();
+    for r in &ranges {
+        *leaders.entry(r.leader.unwrap_or(0)).or_insert(0) += 1;
+    }
+    println!("{} ranges; leaders per node {:?}", ranges.len(), leaders);
+    Ok(())
 }

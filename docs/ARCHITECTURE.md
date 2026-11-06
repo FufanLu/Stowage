@@ -21,8 +21,8 @@ why it is CP.
 ├──────────────────────────────────────────────────────────────────────────────────────┤
 │ Storage engine  B+Tree + buffer pool + WAL (LSM adapter for comparison)             │
 └──────────────────────────────────────────────────────────────────────────────────────┘
-        ▲ heartbeats, placement                                   │ changefeeds
-   stow-pd ×3 (a Raft group: range placement and rebalancing)      ▼  stdout / Kafka / S3
+        ▲ store heartbeats (gossip)                               │ changefeeds
+   scheduler: runs on the leader of range 1 (repair, balance)    ▼  stdout / Kafka / S3
 ```
 
 ## Crates
@@ -35,8 +35,8 @@ why it is CP.
 | `stowage-storage` | B+Tree, buffer pool, WAL, recovery; fjall LSM adapter (feature `lsm`) for comparison | M1 |
 | `stow-bench` | benchmarks (`engine` today; YCSB and cluster workloads later) | M1 |
 | `stowage-raft` | Raft core as a pure state machine; `DiskStorage`; joint consensus; ReadIndex/lease reads | M2 |
-| `stowage-kv` | ranges, Multi-Raft, splits, routing | M3 |
-| `stowage-pd`, `stow-pd` | placement driver | M3 |
+| `stowage-kv` | ranges, Multi-Raft store, splits, routing, scheduler | M3 |
+| `stowage-node`, `stowctl` | TCP runtime, async client, CLI | M3 |
 | `stowage-txn` | MVCC, intents, coordinator, timestamp cache, deadlock detection | M4 |
 | `stowage-sql`, `stowage-pgwire` | SQL engine and Postgres protocol | M5 |
 | `stowage-docapi`, `stowage-cdc` | DynamoDB API, changefeeds, backup / PITR | M6–M7 |
@@ -104,10 +104,34 @@ See [ADR 0004](adr/0004-btree-redo-logging.md) for the reasoning.
   - Mutation testing measures what the suite catches.
   - [Chapter 03](illustrated/03-one-write-through-raft.md).
 
+## Distributed KV (M3)
+
+- **Ranges.** `[start, end)` spans of the key space, each a Raft group, replicated 3 ways.
+  All of a node's replicas share one B+Tree, so a split is a metadata-only Raft
+  command. A new range starts at a placeholder snapshot (index 5, term 5).
+- **Shared Raft log.** One `LogEngine` file per node, holding every group's
+  entries, hard state and snapshot metadata. It is fsynced once per store-loop
+  iteration, before anything leaves the node.
+- **Snapshots** are generated on demand from current state. Nodes create
+  **uninitialized placeholder replicas** for ranges they hear about before
+  having them; those can vote and wait for a snapshot.
+- **Scheduler** on the leader of range 1. It repairs dead or under-replicated
+  ranges first, then balances replicas and leaders, using joint consensus and
+  leadership transfer.
+- **Routing** by store heartbeats (the higher generation wins). Clients cache
+  ranges, follow `NotLeader`, `Locate` after a miss, and treat `Ambiguous` writes
+  as unknown.
+- **Node runtime.** The store runs on its own OS thread, so group commit happens
+  per loop iteration. Peers talk over length-prefixed TCP frames with a two-way
+  HELLO; `stowctl` and `stow-bench kv` are the clients.
+- [ADR 0006](adr/0006-multi-raft-ranges.md),
+  [chapter 04](illustrated/04-a-range-splits.md).
+
 ## Status
 
 M0: workspace, environment traits, HLC and the simulator are in place.
 M1: storage engine, with crash tests and benchmarks.
 M2: single-group Raft with simulation, scenario and mutation testing.
+M3: Multi-Raft key-value layer, TCP cluster, Docker compose.
 Later sections of this document are filled in as each milestone lands. The
 [illustrated chapters](illustrated/README.md) show each piece with real data.

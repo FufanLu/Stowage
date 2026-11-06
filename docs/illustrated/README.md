@@ -12,7 +12,7 @@ Each chapter names the command that regenerates its data.
 | 01 | [A page on disk](01-a-page-on-disk.md) | three keys in a leaf, then the insert that splits it, byte by byte | M1 | ✅ |
 | 02 | [Crash and recover](02-crash-and-recover.md) | a power cut that tears 26 pages and the WAL tail, then recovery; what durability costs | M1 | ✅ |
 | 03 | [One write through Raft](03-one-write-through-raft.md) | the first election, one `PUT` and one `GET` message by message, a minority partition, and the bugs the tests catch | M2 | ✅ |
-| 04 | A range splits | a hot range that splits and moves | M3 | planned |
+| 04 | [A range splits](04-a-range-splits.md) | a split with no data moved, a replica moving by joint consensus, routing after both, real-disk costs, eight bugs from the seams | M3 | ✅ |
 | 05 | A transfer transaction | a two-range transfer: intents, txn record, HLC, conflicts | M4 | planned |
 | 06 | Planning a query | AST → logical plan → memo → physical plan → Arrow batches | M5 | planned |
 | 07 | pgwire on the wire | Parse / Bind / Execute frames from a JDBC client | M5 | planned |

@@ -8,10 +8,12 @@
 //! - [`types`]: entries, messages, membership (joint consensus).
 
 pub mod codec;
+pub mod log_engine;
 pub mod raft;
 pub mod storage;
 pub mod types;
 
+pub use log_engine::{LogBatch, LogEngine, SharedStorage};
 pub use raft::{Config, Raft, RaftStats, ReadMode, Role};
 pub use storage::{DiskStorage, MemStorage, Storage};
 pub use types::{

@@ -9,8 +9,12 @@ publish.workspace = true
 
 [dependencies]
 stowage-common.workspace = true
+stowage-kv.workspace = true
+stowage-node.workspace = true
+stowage-storage.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

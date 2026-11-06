@@ -333,3 +333,41 @@ fn lease_read_is_not_stale_under_partial_partition() {
         );
     }
 }
+
+/// Found by the Multi-Raft simulation: a group whose log starts at a snapshot of
+/// term 5 (as every range created by a split does) began writing entries of term 1
+/// and 2. A replica holding only the snapshot then looked *more* up to date
+/// (last term 5) than one holding acknowledged writes (last term 2), won an
+/// election, and overwrote them.
+#[test]
+fn entries_after_an_initial_snapshot_use_a_higher_term() {
+    use stowage_raft::types::SnapshotMeta;
+    use stowage_raft::{MemStorage, Snapshot, Storage};
+    let mut storage = MemStorage::new(Membership::new([1]));
+    storage
+        .install_snapshot(Snapshot {
+            meta: SnapshotMeta {
+                index: 5,
+                term: 5,
+                membership: Membership::new([1]),
+            },
+            data: Vec::new(),
+        })
+        .unwrap();
+    let mut r = Raft::new(Config::new(1), storage).unwrap();
+    assert!(
+        r.term() >= 5,
+        "term {} is below the snapshot's term 5",
+        r.term()
+    );
+    for _ in 0..30 {
+        r.tick().unwrap();
+    }
+    assert!(r.is_leader());
+    let idx = r.propose(vec![b"x=1".to_vec()]).unwrap();
+    assert!(
+        r.storage().term(idx).unwrap() > 5,
+        "new entry written in term {:?}",
+        r.storage().term(idx)
+    );
+}

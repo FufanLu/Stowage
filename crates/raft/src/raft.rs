@@ -62,6 +62,17 @@ pub struct Config {
     pub lease_margin_ticks: u32,
     /// Seeds the election-timeout jitter (deterministic in simulation).
     pub seed: u64,
+    /// Snapshots for lagging followers are produced by the application on demand
+    /// (see [`Raft::take_snapshot_requests`] / [`Raft::send_snapshot`]) instead of
+    /// being read from `Storage`. A snapshot generated at send time always reflects
+    /// the current state, never a stale one taken at the last compaction.
+    pub app_snapshots: bool,
+    /// The driver writes the log in the background and reports completion with
+    /// [`Raft::mark_durable`]. A leader then counts its own log towards a quorum
+    /// only up to the durable index: it may replicate entries to followers
+    /// *while* writing them locally (thesis §10.2.1) without ever committing an
+    /// entry that a majority has not persisted.
+    pub async_durability: bool,
 }
 
 impl Config {
@@ -77,6 +88,8 @@ impl Config {
             read_mode: ReadMode::ReadIndex,
             lease_margin_ticks: 2,
             seed: id,
+            app_snapshots: false,
+            async_durability: false,
         }
     }
 }
@@ -115,6 +128,9 @@ struct Progress {
     last_resp_tick: u64,
     /// Latest heartbeat round this peer acknowledged (for leases).
     acked_round: u64,
+    /// In this probe cycle, already probed at the compaction boundary (see
+    /// `send_append`), so the next miss means "send a snapshot".
+    tried_boundary: bool,
 }
 
 impl Progress {
@@ -129,6 +145,7 @@ impl Progress {
             last_send_tick: 0,
             last_resp_tick: 0,
             acked_round: 0,
+            tried_boundary: false,
         }
     }
     fn reset_probe(&mut self) {
@@ -136,6 +153,7 @@ impl Progress {
         self.next = self.matched + 1;
         self.probe_sent = false;
         self.inflight.clear();
+        self.tried_boundary = false;
     }
 }
 
@@ -192,6 +210,10 @@ pub struct Raft<S: Storage> {
     transfer_target: Option<NodeId>,
     msgs: Vec<Message>,
     pending_snapshot: Option<Snapshot>,
+    /// Followers that need an application-generated snapshot.
+    snapshot_requests: BTreeSet<NodeId>,
+    /// This node's log is durable up to here (only meaningful with `async_durability`).
+    durable_index: Index,
     /// Term or vote changed and must be persisted before any output is taken.
     hs_dirty: bool,
     stats: RaftStats,
@@ -214,6 +236,15 @@ impl<S: Storage> Raft<S> {
     pub fn new(cfg: Config, store: S) -> Result<Self> {
         let HardState { term, vote } = store.hard_state();
         let snap_index = store.snapshot_meta().index;
+        // A log that starts from a snapshot of term T must only ever get entries of
+        // terms >= T, or "last term" comparisons in elections invert: a replica
+        // holding nothing but the snapshot would look more up to date than one with
+        // newer entries written in a lower term.
+        let (term, vote) = if store.snapshot_meta().term > term {
+            (store.snapshot_meta().term, None)
+        } else {
+            (term, vote)
+        };
         let mut r = Self {
             rng: Xoshiro256::seeded(cfg.seed),
             cfg,
@@ -241,11 +272,14 @@ impl<S: Storage> Raft<S> {
             msgs: Vec::new(),
             pending_snapshot: (snap_index > 0).then(|| store.snapshot()).transpose()?,
             store,
+            snapshot_requests: BTreeSet::new(),
+            durable_index: 0,
             hs_dirty: false,
             stats: RaftStats::default(),
         };
         r.recompute_membership();
         r.reset_election_timer();
+        r.durable_index = r.store.last_index(); // whatever storage returned on open is durable
         Ok(r)
     }
 
@@ -332,6 +366,66 @@ impl<S: Storage> Raft<S> {
             self.applied = last.index;
         }
         entries
+    }
+
+    /// The driver has made this node's log durable up to `index`.
+    pub fn mark_durable(&mut self, index: Index) -> Result<()> {
+        let index = index.min(self.store.last_index());
+        if index > self.durable_index {
+            self.durable_index = index;
+            self.durable(Self::maybe_commit)?;
+        }
+        Ok(())
+    }
+
+    fn self_match(&self) -> Index {
+        let last = self.store.last_index();
+        if self.cfg.async_durability {
+            last.min(self.durable_index)
+        } else {
+            last
+        }
+    }
+
+    /// Followers waiting for a snapshot (only with `app_snapshots`). Answer each
+    /// with [`Raft::send_snapshot`].
+    pub fn take_snapshot_requests(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.snapshot_requests)
+            .into_iter()
+            .collect()
+    }
+
+    /// Send `to` a snapshot of the state machine as of the current applied index;
+    /// `data` must be exactly that state.
+    pub fn send_snapshot(&mut self, to: NodeId, data: Vec<u8>) -> Result<()> {
+        if self.role != Role::Leader {
+            return Ok(());
+        }
+        let index = self.applied;
+        let Some(term) = self.store.term(index) else {
+            return Err(Error::Storage(format!("no term for applied index {index}")));
+        };
+        let membership = self.membership_at(index);
+        let now = self.now_tick;
+        if let Some(pr) = self.progress.get_mut(&to) {
+            pr.state = ReplState::Snapshot(index);
+            pr.last_send_tick = now;
+        }
+        self.stats.snapshots_sent += 1;
+        self.send(
+            to,
+            Body::InstallSnapshot {
+                snapshot: Snapshot {
+                    meta: SnapshotMeta {
+                        index,
+                        term,
+                        membership,
+                    },
+                    data,
+                },
+            },
+        );
+        Ok(())
     }
 
     /// Reads (by caller id) that may now be served from the state machine: the
@@ -556,6 +650,7 @@ impl<S: Storage> Raft<S> {
     }
 
     fn step_inner(&mut self, m: Message) -> Result<()> {
+        tracing::trace!(id = self.cfg.id, from = m.from, term = m.term, my_term = self.term, role = ?self.role, body = ?std::mem::discriminant(&m.body), "step");
         if m.term > self.term {
             match &m.body {
                 Body::PreVote { .. } => {}
@@ -598,6 +693,7 @@ impl<S: Storage> Raft<S> {
                 last_term,
             } => {
                 let granted = !self.in_lease() && self.up_to_date(last_index, last_term);
+                tracing::trace!(id = self.cfg.id, from = m.from, granted, "pre-vote request");
                 if !granted && self.in_lease() {
                     self.stats.votes_refused_in_lease += 1;
                 }
@@ -768,6 +864,14 @@ impl<S: Storage> Raft<S> {
     }
 
     fn tally(&mut self, from: NodeId, granted: bool, pre: bool) -> Result<()> {
+        tracing::trace!(
+            id = self.cfg.id,
+            from,
+            granted,
+            pre,
+            term = self.term,
+            "vote response"
+        );
         if !self.membership.contains(from) {
             return Ok(());
         }
@@ -926,9 +1030,24 @@ impl<S: Storage> Raft<S> {
         if pr.next > last && !allow_empty && pr.state == ReplState::Replicate {
             return Ok(false);
         }
+        let snap_index = self.store.snapshot_meta().index;
+        if pr.next <= snap_index && !pr.tried_boundary {
+            // The follower seems to need entries we compacted. Before paying for a
+            // snapshot, check whether it already has our log's first entry (e.g. a
+            // range replica created by the same split, or one that only lagged
+            // briefly): probe at the compaction boundary once per probe cycle.
+            pr.tried_boundary = true;
+            pr.next = snap_index + 1;
+        }
         let prev = pr.next - 1;
         let Some(prev_term) = self.store.term(prev) else {
             // The entries this follower needs were compacted: send the snapshot.
+            if self.cfg.app_snapshots {
+                pr.state = ReplState::Snapshot(0);
+                pr.last_send_tick = self.now_tick;
+                self.snapshot_requests.insert(peer);
+                return Ok(false);
+            }
             let snapshot = self.store.snapshot()?;
             pr.state = ReplState::Snapshot(snapshot.meta.index);
             pr.last_send_tick = self.now_tick;
@@ -1010,6 +1129,7 @@ impl<S: Storage> Raft<S> {
         pr.recent_active = true;
         pr.last_resp_tick = now;
         if success {
+            pr.tried_boundary = false;
             if match_index > pr.matched {
                 pr.matched = match_index;
             }
@@ -1060,7 +1180,11 @@ impl<S: Storage> Raft<S> {
             let Some(pr) = self.progress.get_mut(&from) else {
                 return Ok(());
             };
+            // Keep "already probed at the boundary": a rejection of that probe
+            // means the follower really needs a snapshot.
+            let tried = pr.tried_boundary;
             pr.reset_probe();
+            pr.tried_boundary = tried;
             pr.next = next.min(prev_index.max(1)).max(pr.matched + 1);
             self.send_append(from, true)?;
         }
@@ -1127,10 +1251,10 @@ impl<S: Storage> Raft<S> {
         }
         let progress = &self.progress;
         let me = self.cfg.id;
-        let last = self.store.last_index();
+        let mine = self.self_match();
         let candidate = self.membership.committed_index(&|id| {
             if id == me {
-                last
+                mine
             } else {
                 progress.get(&id).map_or(0, |p| p.matched)
             }
@@ -1247,6 +1371,9 @@ impl<S: Storage> Raft<S> {
         }
         if start < entries.len() {
             let truncates = entries[start].index <= self.store.last_index();
+            if truncates {
+                self.durable_index = self.durable_index.min(entries[start].index - 1);
+            }
             let has_config = entries[start..]
                 .iter()
                 .any(|e| matches!(e.kind, EntryKind::Config(_)));
@@ -1307,7 +1434,8 @@ impl<S: Storage> Raft<S> {
         self.membership_index = i;
     }
 
-    fn membership_at(&self, index: Index) -> Membership {
+    /// The configuration in effect at log index `index`.
+    pub fn membership_at(&self, index: Index) -> Membership {
         self.config_at(index).0
     }
 

@@ -1,0 +1,42 @@
+# Three-node Stowage cluster.
+#
+#   docker compose -f deploy/compose/docker-compose.yml up -d --build
+#   docker compose -f deploy/compose/docker-compose.yml run --rm bench kv --duration 20
+#   docker compose -f deploy/compose/docker-compose.yml exec n1 stowctl --peers "$PEERS" ranges
+x-node: &node
+  build:
+    context: ../..
+    dockerfile: deploy/docker/stowd.Dockerfile
+  image: stowage/stowd:dev
+  restart: unless-stopped
+  environment:
+    RUST_LOG: info
+    STOWAGE_PEERS: 1=n1:7001,2=n2:7001,3=n3:7001
+
+services:
+  n1:
+    <<: *node
+    command: ["--node-id", "1", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data"]
+    volumes: ["n1:/data"]
+    ports: ["7001:7001"]
+  n2:
+    <<: *node
+    command: ["--node-id", "2", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data"]
+    volumes: ["n2:/data"]
+    ports: ["7002:7001"]
+  n3:
+    <<: *node
+    command: ["--node-id", "3", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data"]
+    volumes: ["n3:/data"]
+    ports: ["7003:7001"]
+  bench:
+    image: stowage/stowd:dev
+    profiles: ["bench"]
+    entrypoint: ["stow-bench"]
+    command: ["kv", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001"]
+    depends_on: [n1, n2, n3]
+
+volumes:
+  n1: {}
+  n2: {}
+  n3: {}

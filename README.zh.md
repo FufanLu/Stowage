@@ -33,7 +33,7 @@ flowchart TB
     doc --> txn
     txn --> kv --> se
   end
-  pd["stow-pd ×3"] <-.-> kv
+  kv -.-> sched["调度器<br/>（由 range 1 的 leader 运行）"]
 ```
 
 Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返回成功。配套项目 [Cartwheel](https://github.com/FufanLu/Cartwheel) 是无主、永远可写的 Dynamo 风格（AP）存储。M9 会用 YCSB 把两者放在一起跑分对比。理由见 [ADR 0003](docs/adr/0003-layered-cp-architecture.md)。
@@ -45,8 +45,8 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | M0 | workspace、CI、环境 trait、HLC、确定性仿真器 | ✅ |
 | M1 | B+Tree、buffer pool、WAL、恢复 | ✅ |
 | M2 | Raft（pre-vote、lease、snapshot、成员变更） | ✅ |
-| M3 | Multi-Raft、range 分裂/合并、调度器 | ⏳ |
-| M4 | 分布式事务、SI / SSI | |
+| M3 | Multi-Raft：range、分裂、再均衡、共享 Raft 日志、TCP 集群 + Docker compose | ✅ |
+| M4 | 分布式事务、SI / SSI | ⏳ |
 | M5 | SQL 引擎 + Postgres 协议 | |
 | M6 | DynamoDB API、CDC、在线 schema 变更 | |
 | M7 | 安全、备份/PITR、配额、可观测性 | |
@@ -69,6 +69,16 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 ### 共识层一览（M2）
 
 手写 Raft。用线性一致性检查器在网络分区、宕机、丢包和频繁换主下验证，另有手写场景测试（包括论文的 Figure 8）。我们故意植入了 6 个经典 Raft bug，测试套件全部抓到：**6 / 6**（[图解 03](docs/illustrated/03-one-write-through-raft.md#36-do-the-tests-actually-catch-raft-bugs)）。
+
+### 集群一览（M3）
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml up -d --build
+cargo run --release -p stowctl -- put hello world
+cargo run --release -p stowctl -- ranges
+```
+
+range 会自动分裂，并在节点之间迁移。调度器不是独立服务，由 range 1 的 leader 兼任。在同一台笔记本上用 Docker Desktop 跑 Linux 三节点：50% 写、64 个客户端时为 1.7–2.5k ops/s；256 个客户端时最高 4.9k ops/s（[图解 04](docs/illustrated/04-a-range-splits.md)，[基准](docs/benchmarks.md#m3--three-node-cluster)）。
 
 ## 快速开始
 

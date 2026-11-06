@@ -37,29 +37,29 @@ pub trait Storage {
     fn compact(&mut self, snap: Snapshot) -> Result<()>;
 }
 
-/// Log entries in memory, shared by both implementations.
+/// Log entries in memory, shared by every implementation.
 #[derive(Debug, Default, Clone)]
-struct Log {
-    snap: SnapshotMeta,
-    entries: Vec<Entry>, // entries[0].index == snap.index + 1
+pub(crate) struct Log {
+    pub(crate) snap: SnapshotMeta,
+    pub(crate) entries: Vec<Entry>, // entries[0].index == snap.index + 1
 }
 
 impl Log {
-    fn last_index(&self) -> Index {
+    pub(crate) fn last_index(&self) -> Index {
         self.entries.last().map_or(self.snap.index, |e| e.index)
     }
-    fn offset(&self, i: Index) -> Option<usize> {
+    pub(crate) fn offset(&self, i: Index) -> Option<usize> {
         let first = self.snap.index + 1;
         (i >= first && i <= self.last_index())
             .then(|| usize::try_from(i - first).unwrap_or(usize::MAX))
     }
-    fn term(&self, i: Index) -> Option<Term> {
+    pub(crate) fn term(&self, i: Index) -> Option<Term> {
         if i == self.snap.index {
             return Some(self.snap.term);
         }
         self.offset(i).map(|o| self.entries[o].term)
     }
-    fn slice(&self, lo: Index, hi: Index, max_bytes: usize) -> Vec<Entry> {
+    pub(crate) fn slice(&self, lo: Index, hi: Index, max_bytes: usize) -> Vec<Entry> {
         let mut out = Vec::new();
         let mut bytes = 0;
         for i in lo..hi {
@@ -74,7 +74,7 @@ impl Log {
         out
     }
     /// Truncate from `entries[0].index` and append; returns the truncation offset.
-    fn splice(&mut self, entries: &[Entry]) -> Result<usize> {
+    pub(crate) fn splice(&mut self, entries: &[Entry]) -> Result<usize> {
         let Some(first) = entries.first() else {
             return Ok(self.entries.len());
         };
@@ -96,7 +96,7 @@ impl Log {
         self.entries.extend_from_slice(entries);
         Ok(keep)
     }
-    fn compact_to(&mut self, meta: SnapshotMeta) {
+    pub(crate) fn compact_to(&mut self, meta: SnapshotMeta) {
         let drop = self.offset(meta.index).map_or(
             if meta.index > self.last_index() {
                 self.entries.len()
