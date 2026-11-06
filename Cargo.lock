@@ -941,6 +941,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "stowage-raft"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "proptest",
+ "stowage-common",
+ "stowage-sim",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "stowage-sim"
 version = "0.1.0"
 dependencies = [

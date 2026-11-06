@@ -223,6 +223,6 @@ rebuilding torn pages.
 | Milestone | Runs inside the simulator |
 |---|---|
 | M1 ✅ | B+Tree + WAL under `CrashMode::Torn`: 2 700 crashes, recovery checked after each ([chapter 02](02-crash-and-recover.md#26-how-this-is-tested)) |
-| M2 | Raft groups under loss, partitions and crashes; a linearizability checker over the client history |
+| M2 ✅ | Raft under loss, partitions, crashes and leader churn; the client history is checked by `stowage_sim::linearizability` (Wing & Gong search with Porcupine-style memoization) ([chapter 03](03-one-write-through-raft.md#35-many-writes-many-failures)) |
 | M3 | range splits and rebalancing with nodes failing mid-move |
 | M4 | bank-transfer transactions; Elle-style cycle detection for SI / SSI anomalies |

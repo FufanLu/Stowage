@@ -44,8 +44,8 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 |---|---|---|
 | M0 | workspace、CI、环境 trait、HLC、确定性仿真器 | ✅ |
 | M1 | B+Tree、buffer pool、WAL、恢复 | ✅ |
-| M2 | Raft（pre-vote、lease、snapshot、成员变更） | ⏳ |
-| M3 | Multi-Raft、range 分裂/合并、调度器 | |
+| M2 | Raft（pre-vote、lease、snapshot、成员变更） | ✅ |
+| M3 | Multi-Raft、range 分裂/合并、调度器 | ⏳ |
 | M4 | 分布式事务、SI / SSI | |
 | M5 | SQL 引擎 + Postgres 协议 | |
 | M6 | DynamoDB API、CDC、在线 schema 变更 | |
@@ -65,6 +65,10 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | 空间占用 / 用户数据 | **1.40×** | 2.16× |
 
 崩溃安全：2700 次带撕裂写的模拟断电、200 次真实 `kill -9`，已确认的写入 0 丢失，batch 0 次只应用一半。
+
+### 共识层一览（M2）
+
+手写 Raft。用线性一致性检查器在网络分区、宕机、丢包和频繁换主下验证，另有手写场景测试（包括论文的 Figure 8）。我们故意植入了 6 个经典 Raft bug，测试套件全部抓到：**6 / 6**（[图解 03](docs/illustrated/03-one-write-through-raft.md#36-do-the-tests-actually-catch-raft-bugs)）。
 
 ## 快速开始
 

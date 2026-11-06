@@ -51,8 +51,8 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 |---|---|---|
 | M0 | workspace, CI, environment traits, HLC, deterministic simulator | ✅ |
 | M1 | B+Tree, buffer pool, WAL, recovery | ✅ |
-| M2 | Raft (pre-vote, leases, snapshots, membership change) | ⏳ |
-| M3 | Multi-Raft, range split/merge, placement driver | |
+| M2 | Raft (pre-vote, leases, snapshots, membership change) | ✅ |
+| M3 | Multi-Raft, range split/merge, placement driver | ⏳ |
 | M4 | distributed transactions, SI / SSI | |
 | M5 | SQL engine + Postgres wire protocol | |
 | M6 | DynamoDB API, CDC, online schema change | |
@@ -74,6 +74,13 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 
 Crash safety: 2 700 simulated power cuts with torn writes and 200 real `kill -9`s,
 with 0 lost acknowledged writes and 0 half-applied batches.
+
+### Consensus at a glance (M2)
+
+A hand-written Raft, checked by a linearizability checker under partitions,
+crashes, message loss and leader churn, plus scripted scenarios such as the paper's
+Figure 8. Six classic Raft bugs were planted on purpose; the suite catches
+**6 / 6** ([chapter 03](docs/illustrated/03-one-write-through-raft.md#36-do-the-tests-actually-catch-raft-bugs)).
 
 ## Quick start
 

@@ -190,6 +190,8 @@ pub struct Simulation<A: Actor> {
     stats: SimStats,
     fingerprint: u64,
     trace: Vec<String>,
+    /// Messages nodes sent to [`CLIENT`], with their delivery time.
+    client_inbox: Vec<(u64, NodeId, A::Msg)>,
 }
 
 impl<A: Actor> Debug for Simulation<A> {
@@ -223,6 +225,7 @@ impl<A: Actor> Simulation<A> {
             stats: SimStats::default(),
             fingerprint: FNV_OFFSET,
             trace: Vec::new(),
+            client_inbox: Vec::new(),
         }
     }
 
@@ -240,6 +243,11 @@ impl<A: Actor> Simulation<A> {
         self.fingerprint
     }
     /// The recorded trace (empty unless [`SimConfig::record_trace`]).
+    /// Drain messages delivered to [`CLIENT`]: `(time, from, msg)`.
+    pub fn take_client_messages(&mut self) -> Vec<(u64, NodeId, A::Msg)> {
+        std::mem::take(&mut self.client_inbox)
+    }
+
     pub fn trace(&self) -> &[String] {
         &self.trace
     }
@@ -351,6 +359,11 @@ impl<A: Actor> Simulation<A> {
                 if self.blocked(from, to) {
                     self.stats.partitioned += 1;
                     self.record(format_args!("cut n{from}->n{to} {msg:?}"));
+                } else if to == CLIENT {
+                    self.stats.delivered += 1;
+                    self.record(format_args!("recv n{from}->client {msg:?}"));
+                    let now = self.now();
+                    self.client_inbox.push((now, from, msg));
                 } else if self.is_up(to) {
                     self.stats.delivered += 1;
                     self.record(format_args!("recv n{from}->n{to} {msg:?}"));

@@ -19,6 +19,8 @@ mod disk;
 mod seeds;
 mod world;
 
+pub mod linearizability;
+
 pub use clock::{SimClock, SimTime};
 pub use disk::{CrashMode, SimDisk};
 pub use seeds::{for_each_seed, seeds};

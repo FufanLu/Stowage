@@ -34,7 +34,7 @@ why it is CP.
 | `stowd` | the node binary | M0 (environment check only) |
 | `stowage-storage` | B+Tree, buffer pool, WAL, recovery; fjall LSM adapter (feature `lsm`) for comparison | M1 |
 | `stow-bench` | benchmarks (`engine` today; YCSB and cluster workloads later) | M1 |
-| `stowage-raft` | Raft core as a pure state machine; log store; snapshots | M2 |
+| `stowage-raft` | Raft core as a pure state machine; `DiskStorage`; joint consensus; ReadIndex/lease reads | M2 |
 | `stowage-kv` | ranges, Multi-Raft, splits, routing | M3 |
 | `stowage-pd`, `stow-pd` | placement driver | M3 |
 | `stowage-txn` | MVCC, intents, coordinator, timestamp cache, deadlock detection | M4 |
@@ -76,9 +76,38 @@ why it is CP.
 
 See [ADR 0004](adr/0004-btree-redo-logging.md) for the reasoning.
 
+## Consensus (M2)
+
+- **Core.** `stowage_raft::Raft` is a synchronous state machine: ticks and messages
+  go in; messages, committed entries, ready reads and snapshots come out. It
+  persists term, vote and entries through `Storage` before emitting anything that
+  depends on them. [ADR 0005](adr/0005-raft-as-a-pure-state-machine.md).
+- **Elections.** Randomized timeouts, pre-vote, and check-quorum with leader
+  stickiness. Leadership transfer uses `TimeoutNow`.
+- **Replication.** Probe and replicate states per follower, pipelined `Append`s with
+  an in-flight limit, fast backtracking with conflict hints, and `InstallSnapshot`
+  for followers behind the compacted log. A leader commits only entries of its
+  own term by counting replicas.
+- **Reads.** ReadIndex (a heartbeat round confirms leadership) or lease (a quorum
+  acknowledged a heartbeat within `election_ticks - margin`). Both wait for the
+  leader's first commit in its term.
+- **Membership.** Joint consensus: `C_old,new` is appended, it commits under both
+  majorities, and then `C_new` is appended automatically. A leader that is not in
+  `C_new` steps down once `C_new` commits.
+- **Storage.** `DiskStorage`: CRC-framed log file, atomically replaced hard-state
+  and snapshot files, generation-based rewrite on compaction.
+- **Verification.**
+  - The simulator runs a KV store on Raft under partitions, crashes, loss,
+    duplication and leader churn. The client history must be linearizable, and an
+    oracle asserts at most one leader per term and identical applied entries.
+  - Scenario tests cover Figure 8, durable votes and lease safety.
+  - Mutation testing measures what the suite catches.
+  - [Chapter 03](illustrated/03-one-write-through-raft.md).
+
 ## Status
 
 M0: workspace, environment traits, HLC and the simulator are in place.
 M1: storage engine, with crash tests and benchmarks.
+M2: single-group Raft with simulation, scenario and mutation testing.
 Later sections of this document are filled in as each milestone lands. The
 [illustrated chapters](illustrated/README.md) show each piece with real data.
