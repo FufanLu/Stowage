@@ -17,8 +17,12 @@ stowage-storage = { path = "crates/storage" }
 stowage-raft = { path = "crates/raft" }
 stowage-kv = { path = "crates/kv" }
 stowage-node = { path = "crates/node" }
+stowage-sql = { path = "crates/sql" }
+stowage-pgwire = { path = "crates/pgwire" }
 
 anyhow = "1"
+arrow = { version = "60", default-features = false }
+sqlparser = "0.63"
 crc32c = "0.6"
 fjall = "3"
 hdrhistogram = "7"

@@ -1223,16 +1223,21 @@ impl Store {
                 if !desc.contains(start) {
                     return Ok(Response::Error(KvError::KeyMoved));
                 }
-                let hi = if desc.end.is_empty() || (!end.is_empty() && end < &desc.end) {
-                    end.clone()
-                } else {
+                let clamped = !desc.end.is_empty() && (end.is_empty() || end > &desc.end);
+                let hi = if clamped {
                     desc.end.clone()
+                } else {
+                    end.clone()
                 };
                 let ok = eval::refresh(&self.engine, start, &hi, *from, *to, *txn)?;
                 if ok {
                     r.tscache.record_span(start, &hi, *to);
                 }
-                Response::Refreshed(ok)
+                if clamped {
+                    Response::RefreshedPart { ok, resume: hi }
+                } else {
+                    Response::Refreshed(ok)
+                }
             }
             _ => Response::Done,
         })

@@ -1,0 +1,62 @@
+statement ok
+CREATE TABLE acct (id INT PRIMARY KEY, bal INT)
+
+statement ok
+INSERT INTO acct VALUES (1, 100), (2, 100)
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE acct SET bal = bal - 30 WHERE id = 1
+
+statement ok
+UPDATE acct SET bal = bal + 30 WHERE id = 2
+
+query II
+SELECT id, bal FROM acct ORDER BY id
+----
+1 70
+2 130
+
+statement ok
+ROLLBACK
+
+query II
+SELECT id, bal FROM acct ORDER BY id
+----
+1 100
+2 100
+
+statement ok
+BEGIN; UPDATE acct SET bal = 0 WHERE id = 1; COMMIT
+
+query I
+SELECT bal FROM acct WHERE id = 1
+----
+0
+
+statement ok
+BEGIN
+
+statement error duplicate key
+INSERT INTO acct VALUES (2, 5)
+
+statement error current transaction is aborted
+SELECT 1
+
+statement ok
+ROLLBACK
+
+query I
+SELECT sum(bal) FROM acct
+----
+100
+
+statement ok
+BEGIN ISOLATION LEVEL REPEATABLE READ; INSERT INTO acct VALUES (3, 1); COMMIT
+
+query I
+SELECT count(*) FROM acct
+----
+3

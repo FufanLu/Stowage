@@ -1,0 +1,76 @@
+statement ok
+CREATE TABLE customers (id INT PRIMARY KEY, name TEXT, country TEXT)
+
+statement ok
+CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, amount FLOAT, status TEXT)
+
+statement ok
+INSERT INTO customers VALUES (1, 'acme', 'us'), (2, 'globex', 'de'), (3, 'initech', 'us')
+
+statement ok
+INSERT INTO orders VALUES (10, 1, 99.5, 'paid'), (11, 1, 20, 'open'), (12, 2, 5.25, 'paid'), (13, 9, 1, 'paid')
+
+query TR rowsort
+SELECT c.name, o.amount FROM customers c JOIN orders o ON o.customer_id = c.id
+----
+acme 20
+acme 99.5
+globex 5.25
+
+query TI rowsort
+SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id AND o.status = 'paid'
+----
+acme 10
+globex 12
+initech NULL
+
+query TR
+SELECT c.name, sum(o.amount) AS total FROM customers c JOIN orders o ON c.id = o.customer_id GROUP BY c.name ORDER BY total DESC
+----
+acme 119.5
+globex 5.25
+
+query TI
+SELECT c.country, count(*) FROM customers c, orders o WHERE c.id = o.customer_id AND o.status = 'paid' GROUP BY c.country ORDER BY 1
+----
+de 1
+us 1
+
+query I
+SELECT count(*) FROM customers c CROSS JOIN orders o
+----
+12
+
+query T
+SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > 10) ORDER BY name
+----
+acme
+
+query T
+SELECT name FROM customers WHERE id NOT IN (SELECT customer_id FROM orders) ORDER BY name
+----
+initech
+
+query R
+SELECT (SELECT max(amount) FROM orders)
+----
+99.5
+
+statement ok
+CREATE TABLE regions (country TEXT PRIMARY KEY, region TEXT)
+
+statement ok
+INSERT INTO regions VALUES ('us', 'americas'), ('de', 'emea')
+
+query TTR rowsort
+SELECT r.region, c.name, o.amount FROM orders o JOIN customers c ON o.customer_id = c.id JOIN regions r ON r.country = c.country WHERE o.status = 'paid'
+----
+americas acme 99.5
+emea globex 5.25
+
+query TI rowsort
+SELECT x.name, x.n FROM (SELECT c.name, count(o.id) AS n FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.name) AS x
+----
+acme 2
+globex 1
+initech 0

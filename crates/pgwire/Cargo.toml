@@ -1,0 +1,21 @@
+[package]
+name = "stowage-pgwire"
+description = "The Postgres wire protocol (v3) in front of a Stowage SQL session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+stowage-sql.workspace = true
+sqlparser.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+stowage-node.workspace = true
+tokio-postgres = "0.7"

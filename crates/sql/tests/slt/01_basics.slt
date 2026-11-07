@@ -1,0 +1,115 @@
+statement ok
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT, city TEXT)
+
+statement ok
+INSERT INTO users VALUES (1, 'ada', 36, 'london'), (2, 'grace', 45, 'nyc'), (3, 'linus', 28, 'helsinki'), (4, 'barbara', NULL, 'nyc')
+
+query ITIT
+SELECT * FROM users
+----
+1 ada 36 london
+2 grace 45 nyc
+3 linus 28 helsinki
+4 barbara NULL nyc
+
+query T
+SELECT name FROM users WHERE age > 30 ORDER BY age DESC
+----
+grace
+ada
+
+query TI
+SELECT name, age + 1 AS next FROM users WHERE city = 'nyc' AND age IS NOT NULL
+----
+grace 46
+
+query I
+SELECT id FROM users ORDER BY id DESC LIMIT 2
+----
+4
+3
+
+query I
+SELECT id FROM users ORDER BY id LIMIT 2 OFFSET 1
+----
+2
+3
+
+query T
+SELECT name FROM users WHERE name LIKE '%a' ORDER BY 1
+----
+ada
+barbara
+
+query T
+SELECT name FROM users WHERE id IN (1, 3) ORDER BY name
+----
+ada
+linus
+
+query T
+SELECT name FROM users WHERE age BETWEEN 30 AND 40
+----
+ada
+
+query T rowsort
+SELECT DISTINCT city FROM users
+----
+helsinki
+london
+nyc
+
+statement ok
+UPDATE users SET age = age + 10, city = 'paris' WHERE id = 3
+
+query IT
+SELECT age, city FROM users WHERE id = 3
+----
+38 paris
+
+statement ok
+DELETE FROM users WHERE age IS NULL
+
+query I
+SELECT count(*) FROM users
+----
+3
+
+query I
+SELECT 1 + 2 * 3
+----
+7
+
+query T
+SELECT upper(name) || '!' FROM users WHERE id = 1
+----
+ADA!
+
+query T
+SELECT CASE WHEN age > 40 THEN 'senior' WHEN age > 30 THEN 'mid' ELSE 'junior' END FROM users ORDER BY id
+----
+mid
+senior
+mid
+
+statement ok
+CREATE TABLE notes (body TEXT)
+
+statement ok
+INSERT INTO notes VALUES ('one'), ('two'), ('two')
+
+query IT
+SELECT count(*), max(body) FROM notes
+----
+3 two
+
+query T
+SELECT * FROM notes ORDER BY body LIMIT 1
+----
+one
+
+statement ok
+DROP TABLE notes
+
+statement error does not exist
+SELECT * FROM notes

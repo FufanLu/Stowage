@@ -13,7 +13,7 @@ use common::txns::{TxnDriver, dec, dec_list, enc, enc_list};
 use stowage_common::Rng;
 use stowage_common::os::Xoshiro256;
 use stowage_kv::StoreConfig;
-use stowage_kv::txn::{Isolation, Outcome, Step, TxnOp};
+use stowage_kv::txn::{Isolation, OpResult, Outcome, Step, TxnOp};
 use stowage_sim::elle::{self, Mop};
 use stowage_sim::{CrashMode, MS, NetConfig, SEC, SimConfig, Simulation, for_each_seed};
 use stowage_storage::BTreeOptions;
@@ -127,6 +127,7 @@ fn dump_history(sim: &Simulation<Node>, d: &TxnDriver) {
             commit_ts,
             reads,
             restarts,
+            ..
         } = &f.outcome
         {
             println!(
@@ -143,7 +144,7 @@ fn dump_history(sim: &Simulation<Node>, d: &TxnDriver) {
 const ACCOUNTS: u64 = 5;
 const START: u64 = 100;
 
-fn bank(seed: u64, iso: Isolation) -> (usize, usize) {
+fn bank(seed: u64, iso: Isolation, interactive: bool) -> (usize, usize) {
     let calm = std::env::var("STOWAGE_TXN_CALM").is_ok();
     let net = NetConfig {
         drop_prob: if calm { 0.0 } else { 0.02 },
@@ -180,7 +181,8 @@ fn bank(seed: u64, iso: Isolation) -> (usize, usize) {
             nemesis(&mut sim, &mut rng);
         }
         while d.running() < 6 {
-            if rng.gen_bool(0.3) {
+            d.interactive = interactive;
+            if rng.gen_bool(0.15) {
                 d.start(
                     &sim,
                     &mut rng,
@@ -192,6 +194,22 @@ fn bank(seed: u64, iso: Isolation) -> (usize, usize) {
                         } else {
                             Step::Commit
                         }
+                    }),
+                );
+            } else if rng.gen_bool(0.18) {
+                // One scan across every range the accounts were split into.
+                d.start(
+                    &sim,
+                    &mut rng,
+                    "scan-audit",
+                    iso,
+                    Box::new(|_, done| match done {
+                        0 => Step::Op(TxnOp::Scan {
+                            start: b"acct".to_vec(),
+                            end: b"acct~".to_vec(),
+                            limit: 100,
+                        }),
+                        _ => Step::Commit,
                     }),
                 );
             } else {
@@ -219,7 +237,9 @@ fn bank(seed: u64, iso: Isolation) -> (usize, usize) {
     settle(&mut sim, &mut d, &mut rng);
     dump_history(&sim, &d);
     let mut audits = 0;
+    let mut scans = 0;
     let mut transfers = 0;
+    let ranges = sim.actor(1).unwrap().store.local_ranges().len();
     for f in &d.finished {
         match (&f.label[..], &f.outcome) {
             ("audit", Outcome::Committed { reads, .. }) => {
@@ -231,6 +251,25 @@ fn bank(seed: u64, iso: Isolation) -> (usize, usize) {
                 );
                 audits += 1;
             }
+            ("scan-audit", Outcome::Committed { results, .. }) => {
+                let Some(OpResult::Rows(rows)) = results.first() else {
+                    panic!("seed {seed}: scan result {results:?}")
+                };
+                assert_eq!(
+                    rows.len() as u64,
+                    ACCOUNTS,
+                    "seed {seed}: the scan saw {} accounts",
+                    rows.len()
+                );
+                let total: u64 = rows.iter().map(|(_, v)| dec(&Some(v.clone()))).sum();
+                assert_eq!(
+                    total,
+                    ACCOUNTS * START,
+                    "seed {seed}: a scan audit saw {total}"
+                );
+                audits += 1;
+                scans += 1;
+            }
             ("transfer", Outcome::Committed { .. }) => transfers += 1,
             (_, Outcome::GaveUp { restarts }) => {
                 panic!("seed {seed}: a transaction gave up after {restarts} restarts")
@@ -238,15 +277,37 @@ fn bank(seed: u64, iso: Isolation) -> (usize, usize) {
             _ => {}
         }
     }
+    assert!(
+        scans >= 5,
+        "seed {seed}: only {scans} scan audits committed"
+    );
+    assert!(
+        ranges >= 3,
+        "seed {seed}: the accounts span only {ranges} ranges; scans would not cross ranges"
+    );
     (audits, transfers)
 }
 
 #[test]
 fn bank_conserves_money_under_ssi() {
     for_each_seed(&[1, 2], |seed| {
-        let (audits, transfers) = bank(seed, Isolation::Serializable);
+        let (audits, transfers) = bank(seed, Isolation::Serializable, false);
         assert!(
             audits > 20 && transfers > 50,
+            "seed {seed}: {audits} audits, {transfers} transfers"
+        );
+    });
+}
+
+/// The same workload with every transaction interactive, as a SQL session runs
+/// them: one op at a time, and a conflict ends the transaction with `Retry`
+/// instead of a transparent restart.
+#[test]
+fn bank_conserves_money_interactive() {
+    for_each_seed(&[5, 6], |seed| {
+        let (audits, transfers) = bank(seed, Isolation::Serializable, true);
+        assert!(
+            audits > 10 && transfers > 30,
             "seed {seed}: {audits} audits, {transfers} transfers"
         );
     });
@@ -255,7 +316,7 @@ fn bank_conserves_money_under_ssi() {
 #[test]
 fn bank_conserves_money_under_si() {
     for_each_seed(&[3, 4], |seed| {
-        let (audits, transfers) = bank(seed, Isolation::Snapshot);
+        let (audits, transfers) = bank(seed, Isolation::Snapshot, false);
         assert!(
             audits > 20 && transfers > 50,
             "seed {seed}: {audits} audits, {transfers} transfers"
@@ -383,6 +444,7 @@ fn list_append(seed: u64, iso: Isolation) -> elle::Report {
                 panic!("seed {seed}: gave up after {restarts} restarts")
             }
             Outcome::Aborted { reads } => (false, reads.clone()),
+            Outcome::Retry { .. } => unreachable!("not interactive"),
         };
         let ops = if f.label == "final" {
             (0..4)
@@ -543,4 +605,82 @@ fn write_skew_si_allows_ssi_prevents() {
         restarts >= 1,
         "SSI prevented the skew by restarting a transaction"
     );
+}
+
+/// Write skew through a phantom: each transaction scans `slot/`, and if it is
+/// empty, inserts its own row. Point reads never touch the other's key, so only
+/// a refresh of the scanned *span* catches the conflict.
+fn phantom(iso: Isolation) -> (usize, usize) {
+    let mut sim = cluster(7, NetConfig::default());
+    let mut rng = Xoshiro256::seeded(7);
+    let mut d = TxnDriver::new(vec![1, 2, 3]);
+    run(&mut sim, &mut d, &mut rng, SEC);
+    for me in ["slot/a", "slot/b"] {
+        d.start(
+            &sim,
+            &mut rng,
+            me,
+            iso,
+            Box::new(move |reads, done| match done {
+                0 => Step::Op(TxnOp::Scan {
+                    start: b"slot/".to_vec(),
+                    end: b"slot0".to_vec(),
+                    limit: 10,
+                }),
+                1 if reads.rows(0).is_some_and(<[_]>::is_empty) => {
+                    Step::Op(TxnOp::Put(me.as_bytes().to_vec(), enc(1)))
+                }
+                _ => Step::Commit,
+            }),
+        );
+    }
+    settle(&mut sim, &mut d, &mut rng);
+    d.start(
+        &sim,
+        &mut rng,
+        "check",
+        iso,
+        Box::new(|_, done| match done {
+            0 => Step::Op(TxnOp::Scan {
+                start: b"slot/".to_vec(),
+                end: b"slot0".to_vec(),
+                limit: 10,
+            }),
+            _ => Step::Commit,
+        }),
+    );
+    settle(&mut sim, &mut d, &mut rng);
+    let Outcome::Committed { results, .. } = &d.finished.last().unwrap().outcome else {
+        panic!()
+    };
+    let Some(OpResult::Rows(rows)) = results.first() else {
+        panic!()
+    };
+    let restarts = d
+        .finished
+        .iter()
+        .map(|f| {
+            if let Outcome::Committed { restarts, .. } = f.outcome {
+                restarts as usize
+            } else {
+                0
+            }
+        })
+        .sum();
+    (rows.len(), restarts)
+}
+
+#[test]
+fn phantom_si_allows_ssi_prevents() {
+    let (rows_si, _) = phantom(Isolation::Snapshot);
+    assert_eq!(
+        rows_si, 2,
+        "SI lets both transactions insert (a phantom write skew)"
+    );
+    let (rows_ssi, restarts) = phantom(Isolation::Serializable);
+    assert_eq!(
+        rows_ssi, 1,
+        "SSI must refresh the scanned span and stop the second insert"
+    );
+    assert!(restarts >= 1);
 }

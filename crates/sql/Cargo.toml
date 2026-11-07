@@ -1,0 +1,24 @@
+[package]
+name = "stowage-sql"
+description = "Stowage SQL: catalog, key encoding, binder, optimizer and a vectorized executor on Arrow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+stowage-common.workspace = true
+stowage-kv.workspace = true
+stowage-node.workspace = true
+sqlparser.workspace = true
+arrow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

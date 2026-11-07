@@ -4,9 +4,11 @@
 
 pub mod client;
 pub mod server;
+#[doc(hidden)]
+pub mod testing;
 pub mod wire;
 
-pub use client::{ClientError, KvClient};
+pub use client::{ClientError, KvClient, Txn, TxnError};
 pub use server::{NodeConfig, run};
 
 /// Parse `1=host:port,2=host:port,...`.

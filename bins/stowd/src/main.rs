@@ -54,6 +54,10 @@ struct Args {
     /// Log as JSON lines.
     #[arg(long)]
     log_json: bool,
+
+    /// Postgres wire protocol listener (SQL); empty to disable.
+    #[arg(long, default_value = "127.0.0.1:5480", env = "STOWAGE_PG_LISTEN")]
+    pg_listen: String,
 }
 
 #[tokio::main]
@@ -86,6 +90,19 @@ async fn main() -> anyhow::Result<()> {
         ..BTreeOptions::default()
     };
     tracing::info!(node = args.node_id, ?peers, data_dir = %args.data_dir.display(), "starting stowd");
+    if !args.pg_listen.is_empty() {
+        // SQL sessions reach the key space through the same client any
+        // application would use: every node is a gateway.
+        let client = std::sync::Arc::new(stowage_node::KvClient::new(peers.clone()));
+        let store: std::sync::Arc<dyn stowage_sql::KvStore> =
+            std::sync::Arc::new(stowage_sql::ClusterKv { client });
+        let addr = args.pg_listen.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stowage_pgwire::serve(&addr, store).await {
+                tracing::error!(error = %e, "pgwire listener failed");
+            }
+        });
+    }
     stowage_node::run(NodeConfig {
         store,
         listen: args.listen,

@@ -10,7 +10,7 @@ pub type LogLine = (u64, String, bool, NodeId, String);
 use std::collections::BTreeMap;
 
 use stowage_common::{NodeId, Rng, Timestamp};
-use stowage_kv::txn::{Isolation, Outcome, Program, TxnCoord};
+use stowage_kv::txn::{Isolation, Outcome, Program, Step, TxnCoord};
 use stowage_kv::{KvError, Request, Response};
 use stowage_sim::{MS, Simulation};
 
@@ -48,6 +48,10 @@ pub struct TxnDriver {
     /// When set, every request sent and reply received: (sim time, txn label,
     /// outgoing?, node, request or reply).
     pub log: Option<Vec<LogLine>>,
+    /// Start transactions as interactive ones: the program is let through one
+    /// step per driver step, the way a SQL session issues statements.
+    pub interactive: bool,
+    gates: BTreeMap<usize, std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl TxnDriver {
@@ -64,6 +68,8 @@ impl TxnDriver {
             resends: 0,
             why: BTreeMap::new(),
             log: None,
+            interactive: false,
+            gates: BTreeMap::new(),
         }
     }
 
@@ -135,11 +141,29 @@ impl TxnDriver {
         let now = self.now(sim);
         let id = (self.next_id << 32) | u128::from(rng.next_u64() as u32);
         self.next_id += 1;
-        self.coords.push(Some((
-            label.into(),
-            TxnCoord::new(id, now, prio, iso, program),
-            sim.now(),
-        )));
+        let coord = if self.interactive {
+            use std::sync::atomic::Ordering;
+            let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let g = gate.clone();
+            let mut inner = program;
+            self.gates.insert(self.coords.len(), gate);
+            TxnCoord::interactive(
+                id,
+                now,
+                prio,
+                iso,
+                Box::new(move |reads, done| {
+                    if g.swap(false, Ordering::SeqCst) {
+                        inner(reads, done)
+                    } else {
+                        Step::Wait
+                    }
+                }),
+            )
+        } else {
+            TxnCoord::new(id, now, prio, iso, program)
+        };
+        self.coords.push(Some((label.into(), coord, sim.now())));
     }
 
     fn route(&self, req: &Request, rng: &mut dyn Rng) -> NodeId {
@@ -282,6 +306,12 @@ impl TxnDriver {
                 continue;
             };
             c.tick(now);
+            if c.is_idle()
+                && let Some(g) = self.gates.get(&i)
+            {
+                g.store(true, std::sync::atomic::Ordering::SeqCst);
+                c.resume();
+            }
             let out = c.take_requests();
             for o in out {
                 let to = self.route(&o.req, rng);

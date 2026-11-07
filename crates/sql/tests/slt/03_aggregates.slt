@@ -1,0 +1,58 @@
+statement ok
+CREATE TABLE sales (id SERIAL PRIMARY KEY, region TEXT, product TEXT, qty INT, price FLOAT)
+
+statement ok
+INSERT INTO sales (region, product, qty, price) VALUES ('east', 'bolt', 10, 0.5), ('east', 'nut', 5, 0.25), ('west', 'bolt', 7, 0.5), ('west', 'gear', NULL, 12.0), ('east', 'bolt', 3, 0.5)
+
+query I
+SELECT max(id) FROM sales
+----
+5
+
+query TII
+SELECT region, count(*), sum(qty) FROM sales GROUP BY region ORDER BY region
+----
+east 3 18
+west 2 7
+
+query TIR
+SELECT product, count(qty), avg(price) FROM sales GROUP BY product ORDER BY product
+----
+bolt 3 0.5
+gear 0 12
+nut 1 0.25
+
+query TI
+SELECT region, count(DISTINCT product) FROM sales GROUP BY 1 ORDER BY 1
+----
+east 2
+west 2
+
+query T
+SELECT region FROM sales GROUP BY region HAVING sum(qty) > 10
+----
+east
+
+query IIR
+SELECT min(qty), max(qty), sum(qty * price) FROM sales
+----
+3 10 11.25
+
+query I
+SELECT count(*) FROM sales WHERE qty > 100
+----
+0
+
+query I
+SELECT sum(qty) FROM sales WHERE qty > 100
+----
+NULL
+
+query TI
+SELECT region, sum(qty) AS s FROM sales GROUP BY region ORDER BY s
+----
+west 7
+east 18
+
+statement error must appear in the GROUP BY clause
+SELECT region, product FROM sales GROUP BY region

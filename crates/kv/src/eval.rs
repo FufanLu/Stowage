@@ -131,7 +131,10 @@ pub fn scan(
         if Some(i.txn.id) == txn {
             own.insert(mvcc::decode_intent_key(&k)?, i.value);
         } else if i.txn.write_ts <= ts && !skip.contains(&i.txn.id) {
-            return Ok(Response::Conflict(i.txn));
+            return Ok(Response::ConflictAt {
+                txn: i.txn,
+                key: mvcc::decode_intent_key(&k)?,
+            });
         }
     }
     let mut rows: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();

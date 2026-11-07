@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use stowage_common::os::{SystemClock, Xoshiro256};
 use stowage_common::{Hlc, NodeId, Rng, Timestamp};
-use stowage_kv::txn::{Isolation, Outcome, Program, TxnCoord};
+use stowage_kv::txn::{Isolation, OpResult, Outcome, Program, Step, TxnCoord, TxnOp};
 use stowage_kv::{KvError, RangeInfo, Request, Response};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
@@ -337,6 +337,14 @@ impl KvClient {
         Err(ClientError::Exhausted(0, "no node answered".into()))
     }
 
+    fn txn_ids(&self) -> (u128, u32) {
+        let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            u128::from(rng.next_u64()) << 64 | u128::from(rng.next_u64()),
+            u32::try_from(rng.next_u64() % (1 << 20)).unwrap_or(1),
+        )
+    }
+
     /// Run `program` as one transaction and return how it ended. The coordinator
     /// state machine is the one the simulator tests ([`TxnCoord`]); this drives it
     /// over the network: each request goes to its range's leader in its own task,
@@ -346,43 +354,35 @@ impl KvClient {
         isolation: Isolation,
         program: Program,
     ) -> Result<Outcome, ClientError> {
-        let (id, priority) = {
-            let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                u128::from(rng.next_u64()) << 64 | u128::from(rng.next_u64()),
-                u32::try_from(rng.next_u64() % (1 << 20)).unwrap_or(1),
-            )
-        };
-        let mut coord = TxnCoord::new(id, self.hlc.now(), priority, isolation, program);
-        let (tx, mut rx) =
-            mpsc::unbounded_channel::<(u64, Request, Result<Response, ClientError>)>();
-        let mut tick = tokio::time::interval(Duration::from_millis(10));
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            for o in coord.take_requests() {
-                let (c, tx) = (self.clone(), tx.clone());
-                tokio::spawn(async move {
-                    let resp = c.route(o.req.clone(), true).await;
-                    let _ = tx.send((o.tag, o.req, resp));
-                });
-            }
-            if coord.is_done() {
-                return coord
-                    .outcome
-                    .clone()
-                    .ok_or_else(|| ClientError::Exhausted(0, "no outcome".into()));
-            }
-            if tokio::time::Instant::now() > deadline {
-                return Err(ClientError::Timeout);
-            }
-            tokio::select! {
-                Some((tag, req, resp)) = rx.recv() => {
-                    let resp = resp?;
-                    self.observe(&resp);
-                    coord.on_response(tag, &req, resp, self.hlc.now());
-                }
-                _ = tick.tick() => coord.tick(self.hlc.now()),
-            }
+        let (id, priority) = self.txn_ids();
+        let mut d = Driver::new(
+            self.clone(),
+            TxnCoord::new(id, self.hlc.now(), priority, isolation, program),
+        );
+        d.run(Duration::from_secs(60)).await?;
+        d.coord
+            .outcome
+            .clone()
+            .ok_or_else(|| ClientError::Exhausted(0, "no outcome".into()))
+    }
+
+    /// Begin an interactive transaction: statements one at a time, as a SQL
+    /// session issues them. A conflict that would need a restart ends it with
+    /// [`TxnError::Retry`]; the caller runs it again from the start.
+    pub fn begin(self: &Arc<Self>, isolation: Isolation) -> Txn {
+        let (id, priority) = self.txn_ids();
+        let next: Arc<std::sync::Mutex<Option<Step>>> = Arc::default();
+        let n = next.clone();
+        let program: Program = Box::new(move |_, _| {
+            n.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or(Step::Wait)
+        });
+        let coord = TxnCoord::interactive(id, self.hlc.now(), priority, isolation, program);
+        Txn {
+            d: Driver::new(self.clone(), coord),
+            next,
         }
     }
 
@@ -404,5 +404,167 @@ impl KvClient {
             }
             _ => {}
         }
+    }
+}
+
+/// Runs one coordinator against the cluster.
+#[derive(Debug)]
+struct Driver {
+    client: Arc<KvClient>,
+    coord: TxnCoord,
+    tx: mpsc::UnboundedSender<(u64, Request, Result<Response, ClientError>)>,
+    rx: mpsc::UnboundedReceiver<(u64, Request, Result<Response, ClientError>)>,
+    tick: tokio::time::Interval,
+}
+
+impl Driver {
+    fn new(client: Arc<KvClient>, coord: TxnCoord) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            client,
+            coord,
+            tx,
+            rx,
+            tick: tokio::time::interval(Duration::from_millis(10)),
+        }
+    }
+
+    /// Drive until the coordinator is done or (interactive) idle again.
+    async fn run(&mut self, limit: Duration) -> Result<(), ClientError> {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            for o in self.coord.take_requests() {
+                let (c, tx) = (self.client.clone(), self.tx.clone());
+                tokio::spawn(async move {
+                    let resp = c.route(o.req.clone(), true).await;
+                    let _ = tx.send((o.tag, o.req, resp));
+                });
+            }
+            if self.coord.is_done() || self.coord.is_idle() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err(ClientError::Timeout);
+            }
+            tokio::select! {
+                Some((tag, req, resp)) = self.rx.recv() => {
+                    let resp = resp?;
+                    self.client.observe(&resp);
+                    let now = self.client.hlc.now();
+                    self.coord.on_response(tag, &req, resp, now);
+                }
+                _ = self.tick.tick() => {
+                    let now = self.client.hlc.now();
+                    self.coord.tick(now);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TxnError {
+    /// The transaction had to restart; run it again (SQLSTATE 40001).
+    #[error("restart transaction: {0}")]
+    Retry(&'static str),
+    #[error("transaction already finished")]
+    Finished,
+    #[error(transparent)]
+    Client(#[from] ClientError),
+}
+
+/// An interactive transaction (see [`KvClient::begin`]).
+#[derive(Debug)]
+pub struct Txn {
+    d: Driver,
+    next: Arc<std::sync::Mutex<Option<Step>>>,
+}
+
+impl Txn {
+    async fn step(&mut self, step: Step) -> Result<Option<OpResult>, TxnError> {
+        if self.d.coord.is_done() {
+            return Err(TxnError::Finished);
+        }
+        let is_op = matches!(step, Step::Op(_));
+        *self.next.lock().unwrap_or_else(|e| e.into_inner()) = Some(step);
+        self.d.coord.resume();
+        self.d.run(Duration::from_secs(60)).await?;
+        match &self.d.coord.outcome {
+            Some(Outcome::Retry { reason }) => Err(TxnError::Retry(reason)),
+            Some(Outcome::GaveUp { .. }) => Err(TxnError::Retry("gave up")),
+            Some(_) if is_op => Err(TxnError::Finished),
+            _ => Ok(if is_op {
+                self.d.coord.results.last().cloned()
+            } else {
+                None
+            }),
+        }
+    }
+
+    /// The snapshot this transaction reads at.
+    pub fn read_ts(&self) -> Timestamp {
+        self.d.coord.read_ts()
+    }
+
+    pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, TxnError> {
+        match self.step(Step::Op(TxnOp::Get(key.to_vec()))).await? {
+            Some(OpResult::Value(v)) => Ok(v),
+            other => Err(TxnError::Client(ClientError::Exhausted(
+                0,
+                format!("unexpected {other:?}"),
+            ))),
+        }
+    }
+
+    /// Up to `limit` live pairs in `[start, end)` (`end` empty: unbounded).
+    pub async fn scan(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        limit: u32,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TxnError> {
+        match self
+            .step(Step::Op(TxnOp::Scan {
+                start: start.to_vec(),
+                end: end.to_vec(),
+                limit,
+            }))
+            .await?
+        {
+            Some(OpResult::Rows(r)) => Ok(r),
+            other => Err(TxnError::Client(ClientError::Exhausted(
+                0,
+                format!("unexpected {other:?}"),
+            ))),
+        }
+    }
+
+    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), TxnError> {
+        self.step(Step::Op(TxnOp::Put(key.to_vec(), value.to_vec())))
+            .await
+            .map(drop)
+    }
+
+    pub async fn delete(&mut self, key: &[u8]) -> Result<(), TxnError> {
+        self.step(Step::Op(TxnOp::Delete(key.to_vec())))
+            .await
+            .map(drop)
+    }
+
+    /// Commit; returns the commit timestamp.
+    pub async fn commit(mut self) -> Result<Timestamp, TxnError> {
+        self.step(Step::Commit).await?;
+        match &self.d.coord.outcome {
+            Some(Outcome::Committed { commit_ts, .. }) => Ok(*commit_ts),
+            Some(Outcome::Retry { reason }) => Err(TxnError::Retry(reason)),
+            _ => Err(TxnError::Finished),
+        }
+    }
+
+    pub async fn rollback(mut self) -> Result<(), TxnError> {
+        if self.d.coord.is_done() {
+            return Ok(());
+        }
+        self.step(Step::Abort).await.map(drop)
     }
 }

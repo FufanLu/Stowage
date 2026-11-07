@@ -232,6 +232,17 @@ pub enum Response {
         min_commit_ts: Timestamp,
     },
     Refreshed(bool),
+    /// A scan ran into another transaction's intent on `key`.
+    ConflictAt {
+        txn: TxnMeta,
+        key: Vec<u8>,
+    },
+    /// A refresh covered its span only up to this range's end: `ok` for that part;
+    /// refresh again from `resume`.
+    RefreshedPart {
+        ok: bool,
+        resume: Vec<u8>,
+    },
     Error(KvError),
 }
 
@@ -509,6 +520,14 @@ impl Response {
             Response::Refreshed(ok) => {
                 w.u8(12).u8(u8::from(*ok));
             }
+            Response::ConflictAt { txn, key } => {
+                w.u8(13);
+                txn.encode(&mut w);
+                w.bytes(key);
+            }
+            Response::RefreshedPart { ok, resume } => {
+                w.u8(14).u8(u8::from(*ok)).bytes(resume);
+            }
             Response::Error(e) => {
                 w.u8(6);
                 match e {
@@ -575,6 +594,14 @@ impl Response {
                 }
             }
             12 => Response::Refreshed(r.u8()? == 1),
+            13 => Response::ConflictAt {
+                txn: TxnMeta::decode(&mut r)?,
+                key: r.bytes()?,
+            },
+            14 => Response::RefreshedPart {
+                ok: r.u8()? == 1,
+                resume: r.bytes()?,
+            },
             6 => Response::Error(match r.u8()? {
                 1 => KvError::NotLeader {
                     range: r.u64()?,
@@ -739,6 +766,14 @@ mod tests {
             },
             Response::Refreshed(true),
             Response::Refreshed(false),
+            Response::ConflictAt {
+                txn: txn.clone(),
+                key: b"k".to_vec(),
+            },
+            Response::RefreshedPart {
+                ok: true,
+                resume: b"m".to_vec(),
+            },
             Response::Value(Some(vec![0, 1, 2])),
         ] {
             assert_eq!(Response::decode(&p.encode()).unwrap(), p);

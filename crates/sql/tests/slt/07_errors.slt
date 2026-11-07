@@ -1,0 +1,26 @@
+statement ok
+CREATE TABLE e (id INT PRIMARY KEY, v TEXT NOT NULL)
+
+statement error violates not-null constraint
+INSERT INTO e VALUES (1, NULL)
+
+statement error column "nope" does not exist
+SELECT nope FROM e
+
+statement error relation "missing" does not exist
+SELECT * FROM missing
+
+statement error already exists
+CREATE TABLE e (id INT PRIMARY KEY)
+
+statement ok
+CREATE TABLE IF NOT EXISTS e (id INT PRIMARY KEY)
+
+statement error syntax error
+SELEC 1
+
+statement error is ambiguous
+SELECT id FROM e a, e b
+
+statement error INSERT has 1 expressions but 2 target columns
+INSERT INTO e VALUES (1)

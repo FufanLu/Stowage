@@ -558,6 +558,7 @@ async fn bank_bench(a: BankArgs) -> anyhow::Result<()> {
                         restarts: r,
                         reads,
                         commit_ts,
+                        ..
                     }) => {
                         if !audit {
                             history.push((commit_ts, xfer.0, xfer.1, xfer.2, reads.clone()));

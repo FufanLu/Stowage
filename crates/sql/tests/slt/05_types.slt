@@ -1,0 +1,78 @@
+statement ok
+CREATE TABLE t (i BIGINT PRIMARY KEY, f DOUBLE PRECISION, b BOOLEAN, s VARCHAR(20), ts TIMESTAMP, n NUMERIC(10,2) DEFAULT 1.5)
+
+statement ok
+INSERT INTO t (i, f, b, s, ts) VALUES (1, 1.25, true, 'x', '2026-11-06 12:30:00'), (2, -3, false, NULL, '1999-12-31 23:59:59.5')
+
+query IRTTTR
+SELECT i, f, b, s, ts, n FROM t ORDER BY i
+----
+1 1.25 t x 2026-11-06 12:30:00 1.5
+2 -3 f NULL 1999-12-31 23:59:59.5 1.5
+
+query I
+SELECT i FROM t WHERE ts > '2000-01-01'
+----
+1
+
+query I
+SELECT i FROM t WHERE b
+----
+1
+
+query R
+SELECT f * 2 FROM t WHERE i = 2
+----
+-6
+
+query I
+SELECT 7 / 2
+----
+3
+
+query R
+SELECT 7.0 / 2
+----
+3.5
+
+query I
+SELECT 7 % 3
+----
+1
+
+query T
+SELECT CAST(42 AS TEXT) || '-' || CAST(1.5 AS TEXT)
+----
+42-1.5
+
+query I
+SELECT CAST('17' AS INT) + 1
+----
+18
+
+query T
+SELECT coalesce(s, 'none') FROM t ORDER BY i
+----
+x
+none
+
+query I
+SELECT length('héllo')
+----
+5
+
+query T
+SELECT substr('stowage', 2, 3)
+----
+tow
+
+statement error division by zero
+SELECT 1 / 0
+
+statement error invalid input syntax for type bigint
+INSERT INTO t (i) VALUES ('abc')
+
+query I
+SELECT count(*) FROM t WHERE s IS NULL
+----
+1

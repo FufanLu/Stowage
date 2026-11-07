@@ -1,0 +1,92 @@
+statement ok
+CREATE TABLE items (sku TEXT PRIMARY KEY, category TEXT, price INT, stock INT)
+
+statement ok
+CREATE INDEX items_category ON items (category)
+
+statement ok
+CREATE UNIQUE INDEX items_price ON items (price)
+
+statement ok
+INSERT INTO items VALUES ('a1', 'tools', 10, 3), ('a2', 'tools', 20, 0), ('b1', 'toys', 5, 9), ('c1', NULL, 7, 1)
+
+query T rowsort
+SELECT sku FROM items WHERE category = 'tools'
+----
+a1
+a2
+
+query T
+SELECT sku FROM items WHERE price = 5
+----
+b1
+
+query T
+SELECT sku FROM items WHERE sku = 'a2'
+----
+a2
+
+query T
+SELECT sku FROM items WHERE sku >= 'a2' AND sku < 'c' ORDER BY sku
+----
+a2
+b1
+
+statement error duplicate key value violates unique constraint "items_price"
+INSERT INTO items VALUES ('d1', 'toys', 10, 1)
+
+statement error duplicate key value violates unique constraint "items_pkey"
+INSERT INTO items VALUES ('a1', 'toys', 99, 1)
+
+statement ok
+INSERT INTO items VALUES ('a1', 'toys', 99, 1) ON CONFLICT DO NOTHING
+
+statement ok
+UPDATE items SET category = 'garden' WHERE sku = 'a1'
+
+query T
+SELECT sku FROM items WHERE category = 'tools'
+----
+a2
+
+query T
+SELECT sku FROM items WHERE category = 'garden'
+----
+a1
+
+statement ok
+UPDATE items SET price = 11 WHERE sku = 'a1'
+
+query T
+SELECT sku FROM items WHERE price = 11
+----
+a1
+
+query I
+SELECT count(*) FROM items WHERE price = 10
+----
+0
+
+statement ok
+DELETE FROM items WHERE category = 'toys'
+
+query I
+SELECT count(*) FROM items WHERE category = 'toys'
+----
+0
+
+statement ok
+CREATE INDEX items_stock ON items (stock)
+
+query T
+SELECT sku FROM items WHERE stock = 0
+----
+a2
+
+statement ok
+DROP INDEX items_stock
+
+query T
+SELECT sku FROM items WHERE stock = 0
+----
+a2
