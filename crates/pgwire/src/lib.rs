@@ -31,10 +31,14 @@ pub fn tls_from_pem(
     cert: &std::path::Path,
     key: &std::path::Path,
 ) -> std::io::Result<Arc<rustls::ServerConfig>> {
-    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(cert)?))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key)?))?
-        .ok_or_else(|| std::io::Error::other(format!("no private key in {}", key.display())))?;
+    use rustls::pki_types::pem::PemObject as _;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let certs = CertificateDer::pem_file_iter(cert)
+        .map_err(|e| std::io::Error::other(format!("{}: {e}", cert.display())))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| std::io::Error::other(format!("{}: {e}", cert.display())))?;
+    let key = PrivateKeyDer::from_pem_file(key)
+        .map_err(|e| std::io::Error::other(format!("{}: {e}", key.display())))?;
     let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
