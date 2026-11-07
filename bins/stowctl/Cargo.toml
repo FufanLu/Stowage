@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 stowage-common.workspace = true
+stowage-backup.workspace = true
 stowage-kv.workspace = true
 stowage-node.workspace = true
 anyhow.workspace = true

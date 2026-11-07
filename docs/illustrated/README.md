@@ -18,5 +18,5 @@ Each chapter names the command that regenerates its data.
 | 07 | [pgwire on the wire](07-pgwire-on-the-wire.md) | startup, a simple query and a prepared one byte by byte, then pgjdbc frame by frame | M5 | ✅ |
 | 08 | [A DynamoDB PutItem](08-a-dynamodb-putitem.md) | a conditional `PutItem` over HTTP, its keys, the changefeed window, the GSI entry, the stream record | M6 | ✅ |
 | 09 | [Online ADD INDEX](09-online-add-index.md) | write-only → backfill → public while three writers change the table; why SSI makes it safe | M6 | ✅ |
-| 10 | Backup and PITR | an accidental `DELETE`, restored to a point in time | M7 | planned |
+| 10 | [Backup and PITR](10-backup-and-pitr.md) | a `DELETE` without `WHERE`, restored to the second before it into a fresh cluster; why changefeed windows make backups gap-free | M7 | ✅ |
 | 11 | AP vs CP | YCSB against Stowage and Cartwheel, healthy and partitioned | M9 | planned |

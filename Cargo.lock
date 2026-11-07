@@ -1896,6 +1896,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "stowage-backup"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "serde",
+ "serde_json",
+ "stowage-common",
+ "stowage-kv",
+ "stowage-node",
+ "stowage-sql",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "stowage-common"
 version = "0.1.0"
 dependencies = [
@@ -2011,6 +2026,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "stowage-backup",
  "stowage-common",
  "stowage-kv",
  "stowage-node",

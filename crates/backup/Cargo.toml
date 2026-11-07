@@ -1,0 +1,25 @@
+[package]
+name = "stowage-backup"
+description = "Full and incremental backups from changefeed windows, and point-in-time restore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+stowage-common.workspace = true
+stowage-kv.workspace = true
+stowage-node.workspace = true
+crc32c.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+stowage-sql.workspace = true
+
+[lints]
+workspace = true

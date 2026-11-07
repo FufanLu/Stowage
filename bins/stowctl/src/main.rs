@@ -55,6 +55,25 @@ enum Cmd {
         #[arg(long)]
         node: u64,
     },
+    /// Back up every version since the newest backup in `dest` (or all, with --full).
+    Backup {
+        dest: std::path::PathBuf,
+        #[arg(long)]
+        full: bool,
+    },
+    /// List the backups in `dest`.
+    Backups {
+        dest: std::path::PathBuf,
+    },
+    /// Restore into an empty cluster the state as of a time
+    /// (`YYYY-MM-DD HH:MM:SS` UTC, `wall,logical`, or `latest`).
+    Restore {
+        src: std::path::PathBuf,
+        #[arg(long, default_value = "latest")]
+        as_of: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// Tail every commit in [start, end): one line per version, in timestamp
     /// order, each exactly once (empty end = to the end).
     Changefeed {
@@ -100,6 +119,38 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Split { key } => {
             client.split(key.as_bytes()).await?;
             println!("OK");
+        }
+        Cmd::Backup { dest, full } => {
+            let m = stowage_backup::backup(&std::sync::Arc::new(client), &dest, full).await?;
+            println!(
+                "{} backup to {} ({}): {} versions of {} keys, {} bytes",
+                m.kind, m.to, m.to_utc, m.versions, m.keys, m.bytes
+            );
+        }
+        Cmd::Backups { dest } => {
+            for (dir, m) in stowage_backup::list(&dest)? {
+                println!(
+                    "{:<12} ({:>22}, {:>22}]  {}  {:>7} versions  {}",
+                    m.kind,
+                    m.from,
+                    m.to,
+                    m.to_utc,
+                    m.versions,
+                    dir.display()
+                );
+            }
+        }
+        Cmd::Restore { src, as_of, force } => {
+            let t = if as_of == "latest" {
+                stowage_common::Timestamp::MAX
+            } else {
+                stowage_backup::parse_as_of(&as_of)?
+            };
+            let r = stowage_backup::restore(&std::sync::Arc::new(client), &src, t, force).await?;
+            println!(
+                "restored {} keys as of {} from {} backups ({} versions read)",
+                r.keys_written, r.as_of, r.backups, r.versions_read
+            );
         }
         Cmd::Changefeed {
             start,
