@@ -47,7 +47,7 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | M2 | Raft（pre-vote、lease、snapshot、成员变更） | ✅ |
 | M3 | Multi-Raft：range、分裂、再均衡、共享 Raft 日志、TCP 集群 + Docker compose | ✅ |
 | M4 | 分布式事务、SI / SSI | ✅ |
-| M5 | SQL 引擎 + Postgres 协议 | |
+| M5 | SQL 引擎 + Postgres 协议 | ✅ |
 | M6 | DynamoDB API、CDC、在线 schema 变更 | |
 | M7 | 安全、备份/PITR、配额、可观测性 | |
 | M8 | 运维控制台、Helm | |
@@ -83,6 +83,22 @@ range 会自动分裂，并在节点之间迁移。调度器不是独立服务�
 ### 事务一览（M4）
 
 跨 range 事务，采用 CockroachDB 的做法：HLC 时间戳、MVCC write intent，以及一条事务记录（记录翻成 `Committed` 那一刻就是提交点）。隔离级别按事务选 SI 或 SSI。仿真中用 Elle 风格的检查器验证：SSI 下没有任何依赖环，SI 下只出现 write skew。在真实三节点集群上，`stow-bench bank` 跑转账加审计，并回放每一笔已提交的转账来校验；中途 `kill -9` 一个节点，钱依然守恒。开发过程中抓到 9 个 bug，其中一个只有真实集群才暴露出来（[图解 05](docs/illustrated/05-a-transfer-transaction.md)，[ADR 0007](docs/adr/0007-transactions.md)）。
+
+### SQL 一览（M5）
+
+```bash
+./target/release/stowd --node-id 1 … --pg-listen 127.0.0.1:5481     # 每个节点都是 SQL 网关
+psql -h 127.0.0.1 -p 5481 -c "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" -c "INSERT INTO t VALUES (1, 'a')"
+psql -h 127.0.0.1 -p 5482 -c "EXPLAIN ANALYZE SELECT * FROM t WHERE id = 1"   # 从另一个节点查
+```
+
+这是建在事务型键空间之上的 Postgres 方言 SQL 引擎，包括：
+- 手写的线协议，`psql`、pgjdbc、tokio-postgres 都能直接连；
+- binder；
+- 优化器：基于 `ANALYZE` 统计信息用动态规划决定 join 顺序，并选择主键或索引的扫描范围；
+- 基于 Arrow 的向量化执行器。
+
+在真实三节点集群上，从任意节点执行一条带分组的四表 join，约 3 ms（[图解 00](docs/illustrated/00-life-of-a-query.md)、[06](docs/illustrated/06-planning-a-query.md)、[07](docs/illustrated/07-pgwire-on-the-wire.md)、[兼容性](docs/compat.md)）。
 
 ## 快速开始
 

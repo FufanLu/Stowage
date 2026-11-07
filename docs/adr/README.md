@@ -9,6 +9,7 @@
 | [0005](0005-raft-as-a-pure-state-machine.md) | Hand-written Raft as a pure state machine |
 | [0006](0006-multi-raft-ranges.md) | Ranges, Multi-Raft, and a scheduler without a separate service |
 | [0007](0007-transactions.md) | Transactions: HLC, MVCC intents, transaction records, SI and SSI |
+| [0008](0008-sql-layer.md) | The SQL layer: Postgres dialect, a Selinger optimizer, Arrow execution |
 
 New ADRs copy the shape of the existing ones: Context, Decision, Consequences,
 Alternatives considered.

@@ -37,7 +37,8 @@ why it is CP.
 | `stowage-raft` | Raft core as a pure state machine; `DiskStorage`; joint consensus; ReadIndex/lease reads | M2 |
 | `stowage-kv` | ranges, Multi-Raft store, splits, routing, scheduler; MVCC, intents, transaction records, timestamp cache, the transaction coordinator | M3–M4 |
 | `stowage-node`, `stowctl` | TCP runtime, async client, CLI | M3 |
-| `stowage-sql`, `stowage-pgwire` | SQL engine and Postgres protocol | M5 |
+| `stowage-sql` | catalog, keys, binder, optimizer, Arrow executor, sessions | M5 |
+| `stowage-pgwire` | the Postgres wire protocol, served by every `stowd` | M5 |
 | `stowage-docapi`, `stowage-cdc` | DynamoDB API, changefeeds, backup / PITR | M6–M7 |
 
 ## Invariants every layer keeps
@@ -155,6 +156,29 @@ See [ADR 0004](adr/0004-btree-redo-logging.md) for the reasoning.
 - [ADR 0007](adr/0007-transactions.md),
   [chapter 05](illustrated/05-a-transfer-transaction.md).
 
+## SQL (M5)
+
+- **Front end.** `sqlparser` (Postgres dialect) → binder → optimizer → executor.
+  The binder resolves names against descriptors read in the statement's
+  transaction, unifies types and rewrites aggregation. Columns are referenced
+  by statement-unique ids.
+- **Storage.** Rows at `0x02 ‖ table ‖ 1 ‖ key(pk)`, secondary indexes at
+  `0x02 ‖ table ‖ index ‖ key(cols) [‖ key(pk)]`, descriptors at
+  `0x01 "table/" ‖ name`. Key encodings are memcomparable.
+- **Optimizer.** Predicate pushdown (outer-join aware), hash-join keys,
+  dynamic-programming join order on `ANALYZE` statistics, primary-key and
+  index range selection, limit pushdown.
+- **Executor.** Arrow record batches, one per operator; kernels for
+  expressions; row-format keys for hash join and hash aggregation; `lexsort`.
+- **Sessions.** Autocommit with internal retry on 40001; `BEGIN … COMMIT` with
+  Postgres' failed-transaction semantics; `EXPLAIN [ANALYZE|VERBOSE]`.
+- **Protocol.** pgwire v3, simple and extended, text and binary.
+- [ADR 0008](adr/0008-sql-layer.md), chapters
+  [00](illustrated/00-life-of-a-query.md),
+  [06](illustrated/06-planning-a-query.md),
+  [07](illustrated/07-pgwire-on-the-wire.md),
+  [compatibility](compat.md).
+
 ## Status
 
 M0: workspace, environment traits, HLC and the simulator are in place.
@@ -162,5 +186,6 @@ M1: storage engine, with crash tests and benchmarks.
 M2: single-group Raft with simulation, scenario and mutation testing.
 M3: Multi-Raft key-value layer, TCP cluster, Docker compose.
 M4: distributed transactions (SI and SSI) on MVCC, verified in simulation and on a real cluster.
+M5: SQL engine and Postgres wire protocol.
 Later sections of this document are filled in as each milestone lands. The
 [illustrated chapters](illustrated/README.md) show each piece with real data.

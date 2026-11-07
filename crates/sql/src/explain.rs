@@ -134,7 +134,7 @@ fn walk(
             ..
         } => {
             let k = if *kind == JoinKind::Left { "left " } else { "" };
-            let mut s = if equi.is_empty() {
+            let s = if equi.is_empty() {
                 format!("NestedLoopJoin {k}")
             } else {
                 format!(
@@ -145,10 +145,11 @@ fn walk(
                         .join(" AND ")
                 )
             };
+            let mut s = s.trim_end().to_owned();
             if let Some(r) = residual {
                 s.push_str(&format!(" · residual {}", e(r)));
             }
-            s.trim_end().to_owned()
+            s
         }
         Plan::Aggregate { group, aggs, .. } => {
             let a = aggs

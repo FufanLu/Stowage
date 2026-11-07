@@ -54,7 +54,7 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | M2 | Raft (pre-vote, leases, snapshots, membership change) | ✅ |
 | M3 | Multi-Raft: ranges, splits, rebalancing, shared Raft log, TCP cluster + Docker compose | ✅ |
 | M4 | distributed transactions, SI / SSI | ✅ |
-| M5 | SQL engine + Postgres wire protocol | |
+| M5 | SQL engine + Postgres wire protocol | ✅ |
 | M6 | DynamoDB API, CDC, online schema change | |
 | M7 | security, backup / PITR, quotas, observability | |
 | M8 | ops console, Helm | |
@@ -108,6 +108,28 @@ committed transfer) conserves money through a `kill -9`. Nine bugs were found on
 the way, one of which only the real cluster showed
 ([chapter 05](docs/illustrated/05-a-transfer-transaction.md),
 [ADR 0007](docs/adr/0007-transactions.md)).
+
+### SQL at a glance (M5)
+
+```bash
+./target/release/stowd --node-id 1 … --pg-listen 127.0.0.1:5481     # every node is a SQL gateway
+psql -h 127.0.0.1 -p 5481 -c "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)" -c "INSERT INTO t VALUES (1, 'a')"
+psql -h 127.0.0.1 -p 5482 -c "EXPLAIN ANALYZE SELECT * FROM t WHERE id = 1"   # from another node
+```
+
+A Postgres-dialect SQL engine on the transactional key space:
+- a hand-written wire protocol that `psql`, pgjdbc and tokio-postgres connect to;
+- a binder;
+- an optimizer that orders joins by dynamic programming on `ANALYZE`
+  statistics and picks primary-key or index ranges;
+- an Arrow-vectorized executor.
+
+On a real three-node cluster, a four-table join with grouping runs in about
+3 ms from any node
+([chapter 00](docs/illustrated/00-life-of-a-query.md),
+[06](docs/illustrated/06-planning-a-query.md),
+[07](docs/illustrated/07-pgwire-on-the-wire.md),
+[compatibility](docs/compat.md)).
 
 ## Quick start
 

@@ -82,6 +82,8 @@ pub struct Session {
     rng: Xoshiro256,
     /// Autocommit statements retried after a serialization conflict.
     pub retries: u64,
+    /// Where the last statement spent its time: (stage, milliseconds).
+    pub timings: Vec<(&'static str, f64)>,
 }
 
 impl std::fmt::Debug for Session {
@@ -129,6 +131,7 @@ impl Session {
             vars,
             rng: Xoshiro256::from_entropy(),
             retries: 0,
+            timings: Vec::new(),
         }
     }
 
@@ -155,6 +158,7 @@ impl Session {
 
     /// Run one statement with `$n` parameters (the extended protocol).
     pub async fn run(&mut self, stmt: &Statement, params: &[Option<String>]) -> Result<Output> {
+        self.timings.clear();
         match stmt {
             Statement::StartTransaction { modes, .. } => {
                 if self.txn.is_some() || self.failed {
@@ -233,11 +237,18 @@ impl Session {
                     let mut attempt = 0;
                     loop {
                         let iso = self.isolation;
+                        let t0 = Instant::now();
                         self.txn = Some(self.store.begin(iso).await?);
+                        self.timings.push(("begin", ms(t0)));
                         let r = self.in_txn(stmt, params).await;
                         let t = self.txn.take();
+                        let t1 = Instant::now();
                         let r = match (r, t) {
-                            (Ok(o), Some(t)) => t.commit().await.map(|()| o),
+                            (Ok(o), Some(t)) => {
+                                let r = t.commit().await.map(|()| o);
+                                self.timings.push(("commit", ms(t1)));
+                                r
+                            }
                             (Err(e), Some(t)) => {
                                 let _ = t.rollback().await;
                                 Err(e)
@@ -316,19 +327,35 @@ impl Session {
         let mut b = Binder::new(txn, params.to_vec(), now);
         match stmt {
             Statement::Query(q) => {
-                let plan = optimizer::optimize(b.bind_query(q).await?);
+                let t = Instant::now();
+                let bound = b.bind_query(q).await?;
+                self.timings.push(("bind", ms(t)));
+                let t = Instant::now();
+                let plan = optimizer::optimize(bound);
+                self.timings.push(("optimize", ms(t)));
+                let t = Instant::now();
                 let batch = exec::execute(&plan, b.txn, now, None).await?;
+                self.timings.push(("execute", ms(t)));
                 Ok(rows_output(&plan, batch))
             }
             Statement::Explain {
-                analyze, statement, ..
+                analyze,
+                verbose,
+                statement,
+                ..
             } => {
                 let Statement::Query(q) = statement.as_ref() else {
                     return unsupported("EXPLAIN of a non-query");
                 };
                 let bound = b.bind_query(q).await?;
-                let plan = optimizer::optimize(bound);
                 let mut lines = Vec::new();
+                if *verbose {
+                    // The plan as bound, before the optimizer touched it.
+                    lines.push("Bound plan:".to_owned());
+                    lines.extend(explain::render(&bound, None));
+                    lines.push("Optimized plan:".to_owned());
+                }
+                let plan = optimizer::optimize(bound);
                 if *analyze {
                     let mut stats: Vec<NodeStat> = Vec::new();
                     let t = Instant::now();
@@ -432,6 +459,10 @@ impl Session {
                 .collect(),
         ))
     }
+}
+
+fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
 }
 
 fn rows_output(plan: &Plan, batch: RecordBatch) -> Output {

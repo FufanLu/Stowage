@@ -146,3 +146,48 @@ total 4922 ops/s · ambiguous writes 107 · errors 0
 | shared log + pipelined fsync (reverted) | Docker | 348 ops/s, p50 132 ms, 45 ambiguous |
 
 What each step changed: [illustrated chapter 04 §4.6](illustrated/04-a-range-splits.md#46-on-real-disks).
+
+## M4 — transactions (`stow-bench bank`)
+
+Transfers between 1 000 accounts (two reads, two writes) and audits (10
+reads), 32 transactions in flight, 6 ranges. The bench replays every committed
+transfer in commit-timestamp order and checks the total at the end: every row
+below has 0 replay anomalies and a total of exactly 1 000 000.
+
+```bash
+./target/release/stow-bench bank --accounts 1000 --concurrency 32 --duration 20 --presplit 6 --isolation ssi
+```
+
+| Environment | Isolation | txn/s | p50 ms | p99 ms | restarts |
+|---|---|--:|--:|--:|--:|
+| Docker Desktop, Linux (fdatasync), fresh cluster | SSI | 77 | 293 | 3 804 | 78 |
+| macOS native (`F_FULLFSYNC`), M4 commit | SSI | 40–50 | 596–737 | 1 855–2 340 | 37–39 |
+| macOS native, a node `kill -9`ed and restarted mid-run | SSI | 53 | 561 | 1 897 | 89 |
+
+An uncontended transfer is 4 sequential Raft writes plus 5 reads and
+refreshes ([chapter 05](illustrated/05-a-transfer-transaction.md)).
+
+## M5 — SQL and the routing fix
+
+The client used to sleep 20 ms before following a `NotLeader` hint, and it
+cached leaders only for ranges it had located explicitly (chapter 06, §6.7).
+Fixing both changed:
+
+| Measurement (macOS native) | Before | After |
+|---|--:|--:|
+| `stow-bench bank`, SSI, 32 in flight | 40–50 txn/s, p50 596–737 ms | 74 txn/s, p50 391 ms, p99 1 351 ms |
+| four-table join from a node that leads no range (chapter 00) | 89 ms | 2–3 ms |
+
+A SQL statement on a three-node cluster, the gateway not being the leader
+(11 runs of chapter 00's query, server-side):
+
+| Stage | Median |
+|---|--:|
+| bind (4 catalog reads) | 0.861 ms |
+| optimize | 0.186 ms |
+| execute (4 scans, 3 hash joins, aggregate, sort) | 1.916 ms |
+| commit (read-only) | 0.119 ms |
+
+Loading the chapter 06 dataset (1 255 rows in 4 multi-row `INSERT`s, plus two
+index entries' worth of writes per order) takes 32 s on macOS: one Raft write
+per row and per index entry, issued one at a time.

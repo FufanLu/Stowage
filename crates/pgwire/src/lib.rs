@@ -537,7 +537,17 @@ impl Conn {
             return self.send(Msg::new(b'I')).await;
         }
         for s in stmts {
-            match self.session.run(&s, &[]).await {
+            let r = self.session.run(&s, &[]).await;
+            if trace_on() {
+                let t: Vec<String> = self
+                    .session
+                    .timings
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v:.3} ms"))
+                    .collect();
+                tracing::info!(pid = self.pid, "pg statement timings: {}", t.join(" · "));
+            }
+            match r {
                 Ok(out) => self.output(out, true).await?,
                 Err(e) => return self.error(&e).await,
             }

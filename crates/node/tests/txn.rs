@@ -61,3 +61,36 @@ async fn interactive_transactions() {
         .count();
     assert_eq!(retried, 1, "exactly one must retry: {ra:?} {rb:?}");
 }
+
+/// A transaction that sits idle between statements (a user thinking inside
+/// BEGIN … COMMIT) keeps its record alive: a conflicting reader that waits on it
+/// for longer than the abandonment timeout must not abort it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_transaction_survives_a_waiting_reader() {
+    let cluster = TestCluster::start(3).await.unwrap();
+    let c = cluster.client();
+    let mut t = c.begin(Isolation::Serializable);
+    t.put(b"k", b"1").await.unwrap();
+    let c2 = c.clone();
+    // An application retrying its read for 4 s: its pushes keep arriving after
+    // the writer's record would look abandoned (2 s) without heartbeats.
+    let reader = tokio::spawn(async move {
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        while tokio::time::Instant::now() < until {
+            let mut r = c2.begin(Isolation::Serializable);
+            let v = r.get(b"k").await;
+            let _ = r.rollback().await;
+            if matches!(v, Ok(Some(_))) {
+                return true;
+            }
+        }
+        false
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await; // > the 2 s timeout, while the reader pushes
+    t.commit()
+        .await
+        .expect("an idle but heartbeating transaction was aborted");
+    let _ = reader.await.unwrap();
+    let mut r = c.begin(Isolation::Serializable);
+    assert_eq!(r.get(b"k").await.unwrap().as_deref(), Some(&b"1"[..]));
+}

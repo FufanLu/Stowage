@@ -201,10 +201,13 @@ impl KvClient {
         let nodes = self.nodes();
         let mut target = self.cached(&key).unwrap_or(nodes[0]);
         let mut last_err = String::new();
+        // Following a leader hint is not a failure: no backoff for that.
+        let mut backoff = false;
         for attempt in 0..30u32 {
-            if attempt > 0 {
+            if attempt > 0 && backoff {
                 tokio::time::sleep(Duration::from_millis(u64::from(attempt.min(10)) * 20)).await;
             }
+            backoff = true;
             let resp = match self.call(target, &req).await {
                 Ok(r) => r,
                 Err(ClientError::Timeout) if is_write => return Err(ClientError::Ambiguous),
@@ -223,8 +226,18 @@ impl KvClient {
                 Response::Error(KvError::NotLeader {
                     leader: Some(l), ..
                 }) if l != target => {
+                    if self.cached(&key).is_none() {
+                        // Learn the range's span from its leader, so the next
+                        // request for any key in it goes straight there.
+                        if let Ok(Response::Location(info)) =
+                            self.call(l, &Request::Locate { key: key.clone() }).await
+                        {
+                            self.remember(info);
+                        }
+                    }
                     self.set_leader(&key, l);
                     target = l;
+                    backoff = false;
                 }
                 Response::Error(
                     e @ (KvError::NotLeader { .. }
@@ -240,6 +253,9 @@ impl KvClient {
                         let leader = info.leader;
                         self.remember(info);
                         if let Some(l) = leader {
+                            // A different leader: try it now. The same node again
+                            // (it is catching up on a split): wait a little.
+                            backoff = l == target;
                             target = l;
                             continue;
                         }
@@ -253,6 +269,13 @@ impl KvClient {
                 }
                 Response::Error(KvError::Busy(m)) => last_err = m,
                 ok => {
+                    if self.cached(&key).is_none()
+                        && let Ok(Response::Location(info)) = self
+                            .call(target, &Request::Locate { key: key.clone() })
+                            .await
+                    {
+                        self.remember(info);
+                    }
                     self.set_leader(&key, target);
                     return Ok(ok);
                 }
@@ -383,6 +406,7 @@ impl KvClient {
         Txn {
             d: Driver::new(self.clone(), coord),
             next,
+            heartbeat: None,
         }
     }
 
@@ -478,6 +502,17 @@ pub enum TxnError {
 pub struct Txn {
     d: Driver,
     next: Arc<std::sync::Mutex<Option<Step>>>,
+    /// Keeps the transaction record alive between statements, while the client
+    /// is not driving the coordinator (a user thinking inside `BEGIN … COMMIT`).
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Txn {
+    fn drop(&mut self) {
+        if let Some(h) = self.heartbeat.take() {
+            h.abort();
+        }
+    }
 }
 
 impl Txn {
@@ -489,6 +524,22 @@ impl Txn {
         *self.next.lock().unwrap_or_else(|e| e.into_inner()) = Some(step);
         self.d.coord.resume();
         self.d.run(Duration::from_secs(60)).await?;
+        if self.heartbeat.is_none()
+            && !self.d.coord.meta().anchor.is_empty()
+            && !self.d.coord.is_done()
+        {
+            // The first write created the record's anchor: heartbeat from now on.
+            let (client, meta) = (self.d.client.clone(), self.d.coord.meta().clone());
+            self.heartbeat = Some(tokio::spawn(async move {
+                let mut every = tokio::time::interval(Duration::from_millis(500));
+                loop {
+                    every.tick().await;
+                    let _ = client
+                        .route(Request::Heartbeat { txn: meta.clone() }, true)
+                        .await;
+                }
+            }));
+        }
         match &self.d.coord.outcome {
             Some(Outcome::Retry { reason }) => Err(TxnError::Retry(reason)),
             Some(Outcome::GaveUp { .. }) => Err(TxnError::Retry("gave up")),
