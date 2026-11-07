@@ -55,7 +55,7 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | M3 | Multi-Raft: ranges, splits, rebalancing, shared Raft log, TCP cluster + Docker compose | ✅ |
 | M4 | distributed transactions, SI / SSI | ✅ |
 | M5 | SQL engine + Postgres wire protocol | ✅ |
-| M6 | DynamoDB API, CDC, online schema change | |
+| M6 | DynamoDB API, CDC, online schema change | ✅ |
 | M7 | security, backup / PITR, quotas, observability | |
 | M8 | ops console, Helm | |
 | M9 | benchmarks, chaos, compatibility runs | |
@@ -130,6 +130,29 @@ On a real three-node cluster, a four-table join with grouping runs in about
 [06](docs/illustrated/06-planning-a-query.md),
 [07](docs/illustrated/07-pgwire-on-the-wire.md),
 [compatibility](docs/compat.md)).
+
+### NoSQL and CDC at a glance (M6)
+
+```python
+ddb = boto3.client("dynamodb", endpoint_url="http://127.0.0.1:8481", region_name="us-east-1",
+                   aws_access_key_id="x", aws_secret_access_key="x")
+ddb.put_item(TableName="orders", Item={...}, ConditionExpression="attribute_not_exists(order_id)")
+```
+
+```bash
+./target/release/stowctl changefeed --from-start      # every commit, exactly once, in timestamp order
+```
+
+The same transactional key space also speaks DynamoDB's JSON protocol:
+- conditions, update expressions, Query/Scan, transactions and Streams, tested
+  with boto3;
+- GSIs maintained asynchronously from a changefeed, which delivers every
+  committed version exactly once;
+- `CREATE INDEX` builds online while writers keep writing.
+
+See [chapter 08](docs/illustrated/08-a-dynamodb-putitem.md),
+[chapter 09](docs/illustrated/09-online-add-index.md) and
+[compatibility](docs/compat.md#dynamodb-compatibility).
 
 ## Quick start
 

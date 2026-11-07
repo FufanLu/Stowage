@@ -431,6 +431,30 @@ impl KvClient {
         ))
     }
 
+    /// The value of `key` as of `ts` (a historical, non-transactional read).
+    /// `Ok(None)` if an unresolved intent at or below `ts` is in the way.
+    pub async fn read_at(
+        &self,
+        key: &[u8],
+        ts: Timestamp,
+    ) -> Result<Option<Option<Vec<u8>>>, ClientError> {
+        match self
+            .route(
+                Request::TxnGet {
+                    key: key.to_vec(),
+                    ts,
+                    txn: None,
+                    skip: Vec::new(),
+                },
+                true,
+            )
+            .await?
+        {
+            Response::Value(v) => Ok(Some(v)),
+            _ => Ok(None),
+        }
+    }
+
     /// The current time on this client's clock (a changefeed cursor).
     pub fn now(&self) -> Timestamp {
         self.hlc.now()

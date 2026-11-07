@@ -58,6 +58,10 @@ struct Args {
     /// Postgres wire protocol listener (SQL); empty to disable.
     #[arg(long, default_value = "127.0.0.1:5480", env = "STOWAGE_PG_LISTEN")]
     pg_listen: String,
+
+    /// DynamoDB-compatible API listener (HTTP); empty to disable.
+    #[arg(long, default_value = "127.0.0.1:8480", env = "STOWAGE_DDB_LISTEN")]
+    ddb_listen: String,
 }
 
 #[tokio::main]
@@ -90,6 +94,19 @@ async fn main() -> anyhow::Result<()> {
         ..BTreeOptions::default()
     };
     tracing::info!(node = args.node_id, ?peers, data_dir = %args.data_dir.display(), "starting stowd");
+    if !args.ddb_listen.is_empty() {
+        let client = std::sync::Arc::new(stowage_node::KvClient::new(peers.clone()));
+        let store: std::sync::Arc<dyn stowage_sql::KvStore> =
+            std::sync::Arc::new(stowage_sql::ClusterKv {
+                client: client.clone(),
+            });
+        let addr = args.ddb_listen.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stowage_docapi::serve(&addr, store, Some(client)).await {
+                tracing::error!(error = %e, "DynamoDB listener failed");
+            }
+        });
+    }
     if !args.pg_listen.is_empty() {
         // SQL sessions reach the key space through the same client any
         // application would use: every node is a gateway.

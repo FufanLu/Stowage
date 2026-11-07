@@ -19,6 +19,7 @@ stowage-kv = { path = "crates/kv" }
 stowage-node = { path = "crates/node" }
 stowage-sql = { path = "crates/sql" }
 stowage-pgwire = { path = "crates/pgwire" }
+stowage-docapi = { path = "crates/docapi" }
 
 anyhow = "1"
 arrow = { version = "60", default-features = false }

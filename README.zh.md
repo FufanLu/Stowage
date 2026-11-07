@@ -48,7 +48,7 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | M3 | Multi-Raft：range、分裂、再均衡、共享 Raft 日志、TCP 集群 + Docker compose | ✅ |
 | M4 | 分布式事务、SI / SSI | ✅ |
 | M5 | SQL 引擎 + Postgres 协议 | ✅ |
-| M6 | DynamoDB API、CDC、在线 schema 变更 | |
+| M6 | DynamoDB API、CDC、在线 schema 变更 | ✅ |
 | M7 | 安全、备份/PITR、配额、可观测性 | |
 | M8 | 运维控制台、Helm | |
 | M9 | 压测、混沌测试、兼容性验证 | |
@@ -99,6 +99,19 @@ psql -h 127.0.0.1 -p 5482 -c "EXPLAIN ANALYZE SELECT * FROM t WHERE id = 1"   # 
 - 基于 Arrow 的向量化执行器。
 
 在真实三节点集群上，从任意节点执行一条带分组的四表 join，约 3 ms（[图解 00](docs/illustrated/00-life-of-a-query.md)、[06](docs/illustrated/06-planning-a-query.md)、[07](docs/illustrated/07-pgwire-on-the-wire.md)、[兼容性](docs/compat.md)）。
+
+### NoSQL 与 CDC 一览（M6）
+
+```bash
+./target/release/stowctl changefeed --from-start      # 每一次提交，恰好一次，按时间戳顺序
+```
+
+同一个事务型键空间同时支持 DynamoDB 的 JSON 协议：
+- 条件写入、更新表达式、Query/Scan、事务和 Streams 都已实现，并用 boto3 实测；
+- GSI 由 changefeed 异步维护，changefeed 保证每个已提交的版本恰好投递一次；
+- `CREATE INDEX` 在线构建，期间写入不受阻塞。
+
+详见[图解 08](docs/illustrated/08-a-dynamodb-putitem.md)、[图解 09](docs/illustrated/09-online-add-index.md)、[兼容性](docs/compat.md#dynamodb-compatibility)。
 
 ## 快速开始
 

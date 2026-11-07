@@ -16,7 +16,7 @@ Each chapter names the command that regenerates its data.
 | 05 | [A transfer transaction](05-a-transfer-transaction.md) | a two-range transfer byte by byte, the timestamp cache, a push and a failed refresh, Elle-style checking, nine bugs (one only a real cluster showed) | M4 | ✅ |
 | 06 | [Planning a query](06-planning-a-query.md) | rows and index entries as keys, binding, pushdown, join order from `ANALYZE` stats, access paths, `EXPLAIN ANALYZE` on a real cluster | M5 | ✅ |
 | 07 | [pgwire on the wire](07-pgwire-on-the-wire.md) | startup, a simple query and a prepared one byte by byte, then pgjdbc frame by frame | M5 | ✅ |
-| 08 | A DynamoDB PutItem | a conditional `PutItem`, key encoding, GSI update via CDC | M6 | planned |
-| 09 | Online ADD INDEX | an index built while writes continue (F1 schema states) | M6 | planned |
+| 08 | [A DynamoDB PutItem](08-a-dynamodb-putitem.md) | a conditional `PutItem` over HTTP, its keys, the changefeed window, the GSI entry, the stream record | M6 | ✅ |
+| 09 | [Online ADD INDEX](09-online-add-index.md) | write-only → backfill → public while three writers change the table; why SSI makes it safe | M6 | ✅ |
 | 10 | Backup and PITR | an accidental `DELETE`, restored to a point in time | M7 | planned |
 | 11 | AP vs CP | YCSB against Stowage and Cartwheel, healthy and partitioned | M9 | planned |

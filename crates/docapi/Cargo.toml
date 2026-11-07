@@ -1,0 +1,27 @@
+[package]
+name = "stowage-docapi"
+description = "A DynamoDB-compatible JSON API over the Stowage key space"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+stowage-common.workspace = true
+stowage-kv.workspace = true
+stowage-node.workspace = true
+stowage-sql.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio.workspace = true
+tracing.workspace = true
+
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

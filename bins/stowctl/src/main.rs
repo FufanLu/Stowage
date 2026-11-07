@@ -55,6 +55,20 @@ enum Cmd {
         #[arg(long)]
         node: u64,
     },
+    /// Tail every commit in [start, end): one line per version, in timestamp
+    /// order, each exactly once (empty end = to the end).
+    Changefeed {
+        #[arg(default_value = "")]
+        start: String,
+        #[arg(default_value = "")]
+        end: String,
+        /// Poll interval, milliseconds.
+        #[arg(long, default_value_t = 200)]
+        every_ms: u64,
+        /// Start from the beginning of history instead of now.
+        #[arg(long)]
+        from_start: bool,
+    },
 }
 
 #[tokio::main]
@@ -86,6 +100,33 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Split { key } => {
             client.split(key.as_bytes()).await?;
             println!("OK");
+        }
+        Cmd::Changefeed {
+            start,
+            end,
+            every_ms,
+            from_start,
+        } => {
+            let client = std::sync::Arc::new(client);
+            let from = if from_start {
+                stowage_common::Timestamp::MIN
+            } else {
+                client.now()
+            };
+            let mut feed =
+                stowage_node::Changefeed::new(client, start.as_bytes(), end.as_bytes(), from);
+            loop {
+                let (events, resolved) = feed.poll().await?;
+                for e in events {
+                    let v = e.value.map_or_else(
+                        || "<deleted>".to_owned(),
+                        |v| String::from_utf8_lossy(&v).into_owned(),
+                    );
+                    println!("{}  {}  {}", e.ts, String::from_utf8_lossy(&e.key), v);
+                }
+                eprintln!("resolved {resolved}");
+                tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+            }
         }
         Cmd::Status { node } => match client.call(node, &stowage_kv::Request::Status).await? {
             stowage_kv::Response::Status(lines) => lines.iter().for_each(|l| println!("{l}")),

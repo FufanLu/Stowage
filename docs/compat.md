@@ -50,3 +50,36 @@ dialect. This page lists what works today; anything else returns SQLSTATE
   until `ROLLBACK`, as in Postgres. `COMMIT` of such a block rolls back.
 - `SERIAL` values come from a transactional counter: no gaps after a rollback,
   and concurrent inserts into one table conflict on it.
+
+# DynamoDB compatibility
+
+Every `stowd` serves the DynamoDB JSON protocol (`X-Amz-Target:
+DynamoDB_20120810.*` and `DynamoDBStreams_20120810.*`) on `--ddb-listen`
+(default `127.0.0.1:8480`). Point an SDK's `endpoint_url` there. Verified by
+[`tests/compat/dynamodb/smoke.py`](../tests/compat/dynamodb/smoke.py) (boto3)
+and `crates/docapi/tests/api.rs` (CI).
+
+| Operation | Supported | Notes |
+|---|---|---|
+| `CreateTable`, `DescribeTable`, `ListTables`, `DeleteTable` | ✅ | hash or hash + range keys; GSIs at creation; streams; billing settings accepted and ignored |
+| `PutItem`, `GetItem`, `UpdateItem`, `DeleteItem` | ✅ | `ConditionExpression`, `ReturnValues` (`ALL_OLD`, `ALL_NEW`, `UPDATED_*`), `ProjectionExpression` |
+| `Query`, `Scan` | ✅ | key conditions `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`; `FilterExpression`; `Limit` + `ExclusiveStartKey`; `ScanIndexForward=false`; `Select=COUNT`; `IndexName` |
+| `BatchWriteItem`, `BatchGetItem` | ✅ | each request applied separately, as in DynamoDB |
+| `TransactWriteItems`, `TransactGetItems` | ✅ | one serializable transaction; `CancellationReasons` |
+| Streams: `ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords` | ✅ | one shard; `NEW_AND_OLD_IMAGES`; `TRIM_HORIZON`, `LATEST`, `AT/AFTER_SEQUENCE_NUMBER` |
+| `UpdateTable`, LSIs, TTL, PartiQL, backups | — | |
+
+Expressions: comparisons, `BETWEEN`, `IN`, `AND/OR/NOT`, `attribute_exists`,
+`attribute_not_exists`, `attribute_type`, `begins_with`, `contains`, `size`;
+`#name` and `:value` placeholders; nested paths (`a.b[0]`). Updates support
+`SET` (with `+`, `-`, `if_not_exists`, `list_append`), `REMOVE`, `ADD`
+(numbers and sets) and `DELETE` (sets).
+
+Differences:
+- **GSIs are eventually consistent**, as in DynamoDB. They lag by about one
+  changefeed poll (≈100–300 ms on one machine).
+- **Numbers** keep their exact text in items, but key ordering uses doubles
+  (exact to 2⁵³; DynamoDB allows 38 digits).
+- No 1 MB page limit, no capacity accounting yet (M7 adds quotas), and
+  credentials are not verified (SigV4 arrives in M7).
+- `ScanIndexForward=false` reads the whole key range before reversing it.

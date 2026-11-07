@@ -10,6 +10,7 @@
 | [0006](0006-multi-raft-ranges.md) | Ranges, Multi-Raft, and a scheduler without a separate service |
 | [0007](0007-transactions.md) | Transactions: HLC, MVCC intents, transaction records, SI and SSI |
 | [0008](0008-sql-layer.md) | The SQL layer: Postgres dialect, a Selinger optimizer, Arrow execution |
+| [0009](0009-cdc-and-documents.md) | Changefeeds, a DynamoDB-compatible API, and online schema changes |
 
 New ADRs copy the shape of the existing ones: Context, Decision, Consequences,
 Alternatives considered.

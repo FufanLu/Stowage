@@ -39,7 +39,8 @@ why it is CP.
 | `stowage-node`, `stowctl` | TCP runtime, async client, CLI | M3 |
 | `stowage-sql` | catalog, keys, binder, optimizer, Arrow executor, sessions | M5 |
 | `stowage-pgwire` | the Postgres wire protocol, served by every `stowd` | M5 |
-| `stowage-docapi`, `stowage-cdc` | DynamoDB API, changefeeds, backup / PITR | M6–M7 |
+| `stowage-docapi` | the DynamoDB-compatible API, GSI worker, Streams | M6 |
+| (in `stowage-kv` / `stowage-node`) | changefeeds: `Changes` windows, `Changefeed` | M6 |
 
 ## Invariants every layer keeps
 
@@ -179,6 +180,23 @@ See [ADR 0004](adr/0004-btree-redo-logging.md) for the reasoning.
   [07](illustrated/07-pgwire-on-the-wire.md),
   [compatibility](compat.md).
 
+## Changefeeds, documents, schema changes (M6)
+
+- **Changefeeds.** `Changes{span, (from, to]}` is a read at `to`: it closes `to`
+  in the timestamp cache, and unresolved intents at or below `to` block it
+  until they are pushed above `to` or resolved. A feed is a sequence of
+  adjacent windows, which delivers every version exactly once (`stowctl
+  changefeed`).
+- **DynamoDB API.** Items at `0x03 ‖ table ‖ 0 ‖ key(hash) [‖ key(range)]`. One
+  SSI transaction per call, and one for each `TransactWriteItems`. GSIs are
+  kept by a single leased worker from the changefeed, with entries, ledger and
+  cursor committed together. Streams are windows over a table.
+- **Online `CREATE INDEX`.** Write-only, then batched backfill in SSI
+  transactions, then public.
+- [ADR 0009](adr/0009-cdc-and-documents.md), chapters
+  [08](illustrated/08-a-dynamodb-putitem.md) and
+  [09](illustrated/09-online-add-index.md).
+
 ## Status
 
 M0: workspace, environment traits, HLC and the simulator are in place.
@@ -187,5 +205,6 @@ M2: single-group Raft with simulation, scenario and mutation testing.
 M3: Multi-Raft key-value layer, TCP cluster, Docker compose.
 M4: distributed transactions (SI and SSI) on MVCC, verified in simulation and on a real cluster.
 M5: SQL engine and Postgres wire protocol.
+M6: changefeeds, the DynamoDB-compatible API, online index builds.
 Later sections of this document are filled in as each milestone lands. The
 [illustrated chapters](illustrated/README.md) show each piece with real data.
