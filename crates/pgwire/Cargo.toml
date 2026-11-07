@@ -12,6 +12,9 @@ stowage-sql.workspace = true
 sqlparser.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
 
 [lints]
 workspace = true
@@ -19,3 +22,6 @@ workspace = true
 [dev-dependencies]
 stowage-node.workspace = true
 tokio-postgres = "0.7"
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

@@ -59,6 +59,15 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:5480", env = "STOWAGE_PG_LISTEN")]
     pg_listen: String,
 
+    /// TLS certificate chain (PEM) for SQL clients; with --pg-tls-key.
+    #[arg(long)]
+    pg_tls_cert: Option<PathBuf>,
+    #[arg(long)]
+    pg_tls_key: Option<PathBuf>,
+    /// Refuse SQL clients that do not use TLS.
+    #[arg(long)]
+    pg_require_tls: bool,
+
     /// Append audit records (logins, privilege failures, DDL, grants) to this file.
     #[arg(long)]
     audit_log: Option<PathBuf>,
@@ -121,8 +130,22 @@ async fn main() -> anyhow::Result<()> {
         let store: std::sync::Arc<dyn stowage_sql::KvStore> =
             std::sync::Arc::new(stowage_sql::ClusterKv { client });
         let addr = args.pg_listen.clone();
+        let tls = stowage_pgwire::TlsPolicy {
+            config: match (&args.pg_tls_cert, &args.pg_tls_key) {
+                (Some(c), Some(k)) => Some(
+                    stowage_pgwire::tls_from_pem(c, k).context("--pg-tls-cert / --pg-tls-key")?,
+                ),
+                (None, None) => None,
+                _ => anyhow::bail!("--pg-tls-cert and --pg-tls-key go together"),
+            },
+            require: args.pg_require_tls,
+        };
+        anyhow::ensure!(
+            !tls.require || tls.config.is_some(),
+            "--pg-require-tls needs a certificate"
+        );
         tokio::spawn(async move {
-            if let Err(e) = stowage_pgwire::serve(&addr, store).await {
+            if let Err(e) = stowage_pgwire::serve_with(&addr, store, tls).await {
                 tracing::error!(error = %e, "pgwire listener failed");
             }
         });

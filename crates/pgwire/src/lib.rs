@@ -20,8 +20,48 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use sqlparser::ast::Statement;
 use stowage_sql::{DataType, KvStore, Output, Session, TxStatus, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
+
+type Reader = Box<dyn AsyncRead + Unpin + Send>;
+type Writer = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// TLS for client connections: the server certificate chain and key (PEM).
+pub fn tls_from_pem(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> std::io::Result<Arc<rustls::ServerConfig>> {
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(cert)?))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key)?))?
+        .ok_or_else(|| std::io::Error::other(format!("no private key in {}", key.display())))?;
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(std::io::Error::other)?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(std::io::Error::other)?;
+    Ok(Arc::new(cfg))
+}
+
+/// How a server treats TLS.
+#[derive(Clone, Default)]
+pub struct TlsPolicy {
+    pub config: Option<Arc<rustls::ServerConfig>>,
+    /// Refuse clients that do not upgrade to TLS.
+    pub require: bool,
+}
+
+impl std::fmt::Debug for TlsPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsPolicy")
+            .field("enabled", &self.config.is_some())
+            .field("require", &self.require)
+            .finish()
+    }
+}
 
 const SSL_REQUEST: i32 = 80_877_103;
 const GSSENC_REQUEST: i32 = 80_877_104;
@@ -30,18 +70,69 @@ const PROTOCOL_3: i32 = 196_608;
 
 /// Accept connections on `addr` and serve each with its own session.
 pub async fn serve(addr: &str, store: Arc<dyn KvStore>) -> std::io::Result<()> {
+    serve_with(addr, store, TlsPolicy::default()).await
+}
+
+/// [`serve`], with TLS: a client's `SSLRequest` is answered `S` and the
+/// connection continues inside TLS.
+pub async fn serve_with(
+    addr: &str,
+    store: Arc<dyn KvStore>,
+    tls: TlsPolicy,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "pgwire listening");
     let next_pid = Arc::new(AtomicU32::new(1));
     loop {
         let (sock, peer) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
-        let (store, pid) = (store.clone(), next_pid.fetch_add(1, Ordering::Relaxed));
+        let (store, pid, tls) = (
+            store.clone(),
+            next_pid.fetch_add(1, Ordering::Relaxed),
+            tls.clone(),
+        );
         tokio::spawn(async move {
-            if let Err(e) = Conn::new(sock, store, pid).run().await {
+            let r = match negotiate(sock, &tls).await {
+                Ok((rd, wr, pending, secure)) => {
+                    Conn::new(rd, wr, store, pid, pending, secure, tls.require)
+                        .run()
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = r {
                 tracing::debug!(%peer, error = %e, "pg connection ended");
             }
         });
+    }
+}
+
+/// Read the first message: an `SSLRequest` is answered (and TLS started when
+/// configured); anything else is handed to the connection unread.
+async fn negotiate(
+    mut sock: TcpStream,
+    tls: &TlsPolicy,
+) -> std::io::Result<(Reader, Writer, Option<Vec<u8>>, bool)> {
+    loop {
+        let len = sock.read_i32().await?;
+        let mut body = vec![0; usize::try_from(len - 4).map_err(|_| Body::err())?];
+        sock.read_exact(&mut body).await?;
+        let code = Body(&body).i32()?;
+        match (code, &tls.config) {
+            (SSL_REQUEST, Some(cfg)) => {
+                sock.write_all(b"S").await?;
+                let stream = tokio_rustls::TlsAcceptor::from(cfg.clone())
+                    .accept(sock)
+                    .await?;
+                let (r, w) = tokio::io::split(stream);
+                return Ok((Box::new(r), Box::new(w), None, true));
+            }
+            (SSL_REQUEST | GSSENC_REQUEST, _) => sock.write_all(b"N").await?, // plain text; the client continues
+            _ => {
+                let (r, w) = sock.into_split();
+                return Ok((Box::new(r), Box::new(w), Some(body), false));
+            }
+        }
     }
 }
 
@@ -171,8 +262,12 @@ fn binary(v: &Value) -> Option<Vec<u8>> {
 
 struct Conn {
     store: Arc<dyn KvStore>,
-    rd: tokio::net::tcp::OwnedReadHalf,
-    wr: BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+    rd: Reader,
+    wr: BufWriter<Writer>,
+    /// The startup message `negotiate` already read.
+    pending: Option<Vec<u8>>,
+    secure: bool,
+    require_tls: bool,
     session: Session,
     pid: u32,
     prepared: HashMap<String, Prepared>,
@@ -182,12 +277,22 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(sock: TcpStream, store: Arc<dyn KvStore>, pid: u32) -> Self {
-        let (rd, wr) = sock.into_split();
+    fn new(
+        rd: Reader,
+        wr: Writer,
+        store: Arc<dyn KvStore>,
+        pid: u32,
+        pending: Option<Vec<u8>>,
+        secure: bool,
+        require_tls: bool,
+    ) -> Self {
         Self {
             store: store.clone(),
             rd,
             wr: BufWriter::new(wr),
+            pending,
+            secure,
+            require_tls,
             session: Session::new(store),
             pid,
             prepared: HashMap::new(),
@@ -229,9 +334,16 @@ impl Conn {
 
     async fn startup(&mut self) -> std::io::Result<bool> {
         loop {
-            let len = self.rd.read_i32().await?;
-            let mut body = vec![0; usize::try_from(len - 4).map_err(|_| Body::err())?];
-            self.rd.read_exact(&mut body).await?;
+            let body = match self.pending.take() {
+                Some(b) => b,
+                None => {
+                    let len = self.rd.read_i32().await?;
+                    let mut body = vec![0; usize::try_from(len - 4).map_err(|_| Body::err())?];
+                    self.rd.read_exact(&mut body).await?;
+                    body
+                }
+            };
+            let len = body.len() + 4;
             let mut b = Body(&body);
             let code = b.i32()?;
             if trace_on() {
@@ -248,6 +360,12 @@ impl Conn {
                     self.wr.flush().await?;
                 }
                 CANCEL_REQUEST => return Ok(false),
+                PROTOCOL_3 if self.require_tls && !self.secure => {
+                    self.error_raw("28000", "this server requires TLS (sslmode=require)")
+                        .await?;
+                    self.wr.flush().await?;
+                    return Ok(false);
+                }
                 PROTOCOL_3 => {
                     let mut params = HashMap::new();
                     while let Ok(k) = b.cstr() {

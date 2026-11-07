@@ -197,3 +197,99 @@ async fn scram_and_privileges() {
     assert!(connect("app", Some("app-pw")).await.is_err());
     assert!(connect("app", Some("new-pw")).await.is_ok());
 }
+
+/// TLS: `SSLRequest` → `S` → a handshake, then the protocol inside TLS; with
+/// `require`, a plain-text startup is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_upgrade_and_require() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let cluster = TestCluster::start(3).await.unwrap();
+    let store: Arc<dyn KvStore> = Arc::new(ClusterKv {
+        client: cluster.client(),
+    });
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = std::env::temp_dir().join(format!("stowage-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cert.pem"), ck.cert.pem()).unwrap();
+    std::fs::write(dir.join("key.pem"), ck.key_pair.serialize_pem()).unwrap();
+    let cfg = stowage_pgwire::tls_from_pem(&dir.join("cert.pem"), &dir.join("key.pem")).unwrap();
+    let addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let a = addr.clone();
+    tokio::spawn(async move {
+        stowage_pgwire::serve_with(
+            &a,
+            store,
+            stowage_pgwire::TlsPolicy {
+                config: Some(cfg),
+                require: true,
+            },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let startup = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&196_608i32.to_be_bytes());
+        b.extend_from_slice(b"user\0stowage\0\0");
+        let mut m = ((b.len() + 4) as i32).to_be_bytes().to_vec();
+        m.extend(b);
+        m
+    };
+    // Plain text is refused.
+    let (host, port) = addr.split_once(':').unwrap();
+    let mut plain = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    plain.write_all(&startup).await.unwrap();
+    let mut reply = Vec::new();
+    plain.read_to_end(&mut reply).await.unwrap();
+    assert_eq!(reply[0], b'E');
+    assert!(
+        String::from_utf8_lossy(&reply).contains("28000"),
+        "{reply:?}"
+    );
+
+    // TLS: upgrade, then start up and query inside it.
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    sock.write_all(&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f])
+        .await
+        .unwrap(); // SSLRequest 80877103
+    let mut s = [0u8; 1];
+    sock.read_exact(&mut s).await.unwrap();
+    assert_eq!(&s, b"S");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ck.cert.der().clone()).unwrap();
+    let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_cfg))
+        .connect(name, sock)
+        .await
+        .unwrap();
+    let _ = (host, port);
+    tls.write_all(&startup).await.unwrap();
+    let mut q = b"Q".to_vec();
+    let sql = b"SELECT 6 * 7\0";
+    q.extend_from_slice(&((sql.len() + 4) as i32).to_be_bytes());
+    q.extend_from_slice(sql);
+    tls.write_all(&q).await.unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&got).contains("SELECT 1") {
+        let n = tls.read(&mut buf).await.unwrap();
+        assert!(n > 0, "connection closed: {got:?}");
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert!(
+        got.windows(2).any(|w| w == b"42"),
+        "the answer came back inside TLS"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
