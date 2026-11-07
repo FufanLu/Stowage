@@ -360,6 +360,82 @@ impl KvClient {
         Err(ClientError::Exhausted(0, "no node answered".into()))
     }
 
+    /// Every version committed in `(from, to]` in `[start, end)`, across ranges.
+    /// Intents in the way are pushed above `to` (or resolved, if their
+    /// transaction already finished), so the window is complete: nothing will
+    /// ever commit at or below `to` in this span again.
+    pub async fn changes(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        from: Timestamp,
+        to: Timestamp,
+    ) -> Result<Vec<stowage_kv::Change>, ClientError> {
+        use stowage_kv::mvcc::TxnStatus;
+        use stowage_kv::types::PushKind;
+        let mut out = Vec::new();
+        let mut cur = start.to_vec();
+        let mut skip: Vec<u128> = Vec::new();
+        for _ in 0..10_000 {
+            let req = Request::Changes {
+                start: cur.clone(),
+                end: end.to_vec(),
+                from,
+                to,
+                limit: 10_000,
+                skip: skip.clone(),
+            };
+            match self.route(req, true).await? {
+                Response::Changes { events, resume } => {
+                    out.extend(events);
+                    if resume.is_empty() || (!end.is_empty() && resume.as_slice() >= end) {
+                        return Ok(out);
+                    }
+                    cur = resume;
+                }
+                Response::ConflictAt { txn, key } => {
+                    // Like a reader at `to` with the highest priority: the writer
+                    // commits above the window, or we learn its fate.
+                    let push = Request::Push {
+                        pushee: txn.clone(),
+                        kind: PushKind::Timestamp {
+                            ts: to,
+                            priority: u32::MAX,
+                        },
+                    };
+                    match self.route(push, true).await? {
+                        Response::Txn {
+                            status: TxnStatus::Pending,
+                            ..
+                        } => skip.push(txn.id),
+                        Response::Txn {
+                            status, commit_ts, ..
+                        } => {
+                            let resolve = Request::Resolve {
+                                key,
+                                txn_id: txn.id,
+                                commit: status == TxnStatus::Committed,
+                                commit_ts,
+                            };
+                            self.route(resolve, true).await?;
+                        }
+                        other => return Err(ClientError::Unexpected(other)),
+                    }
+                }
+                other => return Err(ClientError::Unexpected(other)),
+            }
+        }
+        Err(ClientError::Exhausted(
+            10_000,
+            "changefeed window did not converge".into(),
+        ))
+    }
+
+    /// The current time on this client's clock (a changefeed cursor).
+    pub fn now(&self) -> Timestamp {
+        self.hlc.now()
+    }
+
     fn txn_ids(&self) -> (u128, u32) {
         let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
         (
@@ -617,5 +693,40 @@ impl Txn {
             return Ok(());
         }
         self.step(Step::Abort).await.map(drop)
+    }
+}
+
+/// Tails `[start, end)`: each [`Changefeed::poll`] returns the versions committed
+/// since the previous one, in timestamp order, and the closed timestamp it
+/// reached. Every committed version is delivered exactly once.
+#[derive(Debug)]
+pub struct Changefeed {
+    client: Arc<KvClient>,
+    start: Vec<u8>,
+    end: Vec<u8>,
+    /// Everything at or below this has been delivered.
+    pub cursor: Timestamp,
+}
+
+impl Changefeed {
+    /// Start delivering changes committed after `from`.
+    pub fn new(client: Arc<KvClient>, start: &[u8], end: &[u8], from: Timestamp) -> Self {
+        Self {
+            client,
+            start: start.to_vec(),
+            end: end.to_vec(),
+            cursor: from,
+        }
+    }
+
+    pub async fn poll(&mut self) -> Result<(Vec<stowage_kv::Change>, Timestamp), ClientError> {
+        let to = self.client.now();
+        let mut events = self
+            .client
+            .changes(&self.start, &self.end, self.cursor, to)
+            .await?;
+        events.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.key.cmp(&b.key)));
+        self.cursor = to;
+        Ok((events, to))
     }
 }

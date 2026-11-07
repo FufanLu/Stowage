@@ -201,6 +201,60 @@ pub fn refresh(
     Ok(true)
 }
 
+/// A changefeed window: every version committed in `(from, to]` in
+/// `[start, end)`, up to about `limit` (always whole keys). An intent at or below
+/// `to` of a transaction not in `skip` blocks it: the caller must push or resolve
+/// that transaction first, or the window could miss a commit at or below `to`.
+pub fn changes(
+    engine: &BTree,
+    start: &[u8],
+    end: &[u8],
+    from: Timestamp,
+    to: Timestamp,
+    limit: usize,
+    skip: &[u128],
+) -> Result<Response> {
+    let (ilo, ihi) = mvcc::span(INTENT, start, end);
+    for kv in engine.iter(Bound::Included(&ilo), Bound::Excluded(&ihi)) {
+        let (k, v) = kv.map_err(err)?;
+        let i = Intent::decode(&v)?;
+        if i.txn.write_ts <= to && !skip.contains(&i.txn.id) {
+            return Ok(Response::ConflictAt {
+                txn: i.txn,
+                key: mvcc::decode_intent_key(&k)?,
+            });
+        }
+    }
+    let (lo, hi) = mvcc::span(VERSION, start, end);
+    let mut events = Vec::new();
+    let mut last: Option<Vec<u8>> = None;
+    for kv in engine.iter(Bound::Included(&lo), Bound::Excluded(&hi)) {
+        let (k, v) = kv.map_err(err)?;
+        let (user, ts) = mvcc::decode_version_key(&k)?;
+        if last.as_ref() != Some(&user) {
+            if events.len() >= limit {
+                // Stop between keys, so a key's versions never straddle two pages.
+                return Ok(Response::Changes {
+                    events,
+                    resume: user,
+                });
+            }
+            last = Some(user.clone());
+        }
+        if ts > from && ts <= to {
+            events.push(crate::msg::Change {
+                key: user,
+                ts,
+                value: decode_value(&v),
+            });
+        }
+    }
+    Ok(Response::Changes {
+        events,
+        resume: Vec::new(),
+    })
+}
+
 fn record(engine: &BTree, txn: &TxnMeta) -> Result<Option<TxnRecord>> {
     engine
         .get(&txn_key(&txn.anchor, txn.id))

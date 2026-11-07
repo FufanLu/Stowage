@@ -206,6 +206,27 @@ pub enum Request {
         to: Timestamp,
         txn: u128,
     },
+    /// Every version committed in `(from, to]` in `[start, end)` (a changefeed
+    /// window). Like a read at `to`: once answered, nothing can commit at or below
+    /// `to` there any more, so `to` is a closed timestamp. Intents of the
+    /// transactions in `skip` were pushed above `to`.
+    Changes {
+        start: Vec<u8>,
+        end: Vec<u8>,
+        from: Timestamp,
+        to: Timestamp,
+        limit: u32,
+        skip: Vec<u128>,
+    },
+}
+
+/// One committed write, as a changefeed reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub key: Vec<u8>,
+    pub ts: Timestamp,
+    /// `None`: deleted.
+    pub value: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +262,11 @@ pub enum Response {
     /// refresh again from `resume`.
     RefreshedPart {
         ok: bool,
+        resume: Vec<u8>,
+    },
+    /// Changes in the requested window; continue from `resume` unless it is empty.
+    Changes {
+        events: Vec<Change>,
         resume: Vec<u8>,
     },
     Error(KvError),
@@ -359,6 +385,23 @@ impl Request {
                 put_txn_id(&mut w, Some(*txn));
                 &mut w
             }
+            Request::Changes {
+                start,
+                end,
+                from,
+                to,
+                limit,
+                skip,
+            } => {
+                w.u8(17).bytes(start).bytes(end);
+                put_ts(&mut w, *from);
+                put_ts(&mut w, *to);
+                w.u32(*limit).u32(skip.len() as u32);
+                for s in skip {
+                    put_txn_id(&mut w, Some(*s));
+                }
+                &mut w
+            }
         };
         w.finish()
     }
@@ -432,6 +475,27 @@ impl Request {
                 to: get_ts(&mut r)?,
                 txn: get_txn_id(&mut r)?.unwrap_or(0),
             },
+            17 => {
+                let (start, end, from, to, limit) = (
+                    r.bytes()?,
+                    r.bytes()?,
+                    get_ts(&mut r)?,
+                    get_ts(&mut r)?,
+                    r.u32()?,
+                );
+                let n = r.u32()?;
+                let skip = (0..n)
+                    .map(|_| get_txn_id(&mut r).map(|x| x.unwrap_or(0)))
+                    .collect::<Result<_>>()?;
+                Request::Changes {
+                    start,
+                    end,
+                    from,
+                    to,
+                    limit,
+                    skip,
+                }
+            }
             k => return Err(Error::Codec(format!("request kind {k}"))),
         };
         r.done()?;
@@ -448,7 +512,8 @@ impl Request {
             | Request::Split { key } => Some(key),
             Request::Scan { start, .. }
             | Request::TxnScan { start, .. }
-            | Request::Refresh { start, .. } => Some(start),
+            | Request::Refresh { start, .. }
+            | Request::Changes { start, .. } => Some(start),
             Request::TxnGet { key, .. }
             | Request::TxnPut { key, .. }
             | Request::Resolve { key, .. } => Some(key),
@@ -525,6 +590,15 @@ impl Response {
                 txn.encode(&mut w);
                 w.bytes(key);
             }
+            Response::Changes { events, resume } => {
+                w.u8(15).u32(events.len() as u32);
+                for e in events {
+                    w.bytes(&e.key);
+                    put_ts(&mut w, e.ts);
+                    w.opt_bytes(e.value.as_deref());
+                }
+                w.bytes(resume);
+            }
             Response::RefreshedPart { ok, resume } => {
                 w.u8(14).u8(u8::from(*ok)).bytes(resume);
             }
@@ -598,6 +672,21 @@ impl Response {
                 txn: TxnMeta::decode(&mut r)?,
                 key: r.bytes()?,
             },
+            15 => {
+                let n = r.u32()?;
+                let mut events = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    events.push(Change {
+                        key: r.bytes()?,
+                        ts: get_ts(&mut r)?,
+                        value: r.opt_bytes()?,
+                    });
+                }
+                Response::Changes {
+                    events,
+                    resume: r.bytes()?,
+                }
+            }
             14 => Response::RefreshedPart {
                 ok: r.u8()? == 1,
                 resume: r.bytes()?,
@@ -735,6 +824,14 @@ mod tests {
                 kind: PushKind::Abort { priority: 8 },
             },
             Request::Heartbeat { txn: txn.clone() },
+            Request::Changes {
+                start: b"a".to_vec(),
+                end: vec![],
+                from: ts,
+                to: ts.next(),
+                limit: 100,
+                skip: vec![1, 2 << 100],
+            },
             Request::Refresh {
                 start: b"a".to_vec(),
                 end: b"a\0".to_vec(),
@@ -773,6 +870,21 @@ mod tests {
             Response::RefreshedPart {
                 ok: true,
                 resume: b"m".to_vec(),
+            },
+            Response::Changes {
+                events: vec![
+                    Change {
+                        key: b"a".to_vec(),
+                        ts,
+                        value: Some(b"1".to_vec()),
+                    },
+                    Change {
+                        key: b"b".to_vec(),
+                        ts: ts.next(),
+                        value: None,
+                    },
+                ],
+                resume: b"c".to_vec(),
             },
             Response::Value(Some(vec![0, 1, 2])),
         ] {

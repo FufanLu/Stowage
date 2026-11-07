@@ -780,7 +780,8 @@ impl Store {
             | Request::Scan { .. }
             | Request::TxnGet { .. }
             | Request::TxnScan { .. }
-            | Request::Refresh { .. } => {
+            | Request::Refresh { .. }
+            | Request::Changes { .. } => {
                 // Non-transactional reads see the latest state; transactional ones
                 // read at the transaction's timestamp (which the clock observes).
                 // Non-transactional reads take the latest committed state: they
@@ -791,7 +792,7 @@ impl Store {
                         let _ = self.hlc.update(*ts);
                         *ts
                     }
-                    Request::Refresh { to, .. } => {
+                    Request::Refresh { to, .. } | Request::Changes { to, .. } => {
                         let _ = self.hlc.update(*to);
                         *to
                     }
@@ -807,7 +808,8 @@ impl Store {
                     }
                     Request::Scan { start, end, .. }
                     | Request::TxnScan { start, end, .. }
-                    | Request::Refresh { start, end, .. } => {
+                    | Request::Refresh { start, end, .. }
+                    | Request::Changes { start, end, .. } => {
                         r.tscache.record_span(start, end, cache_ts);
                     }
                     _ => {}
@@ -1237,6 +1239,30 @@ impl Store {
                     Response::RefreshedPart { ok, resume: hi }
                 } else {
                     Response::Refreshed(ok)
+                }
+            }
+            Request::Changes {
+                start,
+                end,
+                from,
+                to,
+                limit,
+                skip,
+            } => {
+                if !desc.contains(start) {
+                    return Ok(Response::Error(KvError::KeyMoved));
+                }
+                let clamped = !desc.end.is_empty() && (end.is_empty() || end > &desc.end);
+                let hi = if clamped {
+                    desc.end.clone()
+                } else {
+                    end.clone()
+                };
+                match eval::changes(&self.engine, start, &hi, *from, *to, *limit as usize, skip)? {
+                    Response::Changes { events, resume } if resume.is_empty() && clamped => {
+                        Response::Changes { events, resume: hi }
+                    }
+                    other => other,
                 }
             }
             _ => Response::Done,

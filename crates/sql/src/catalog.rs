@@ -37,6 +37,9 @@ pub struct Index {
     /// Positions in the table's columns.
     pub columns: Vec<usize>,
     pub unique: bool,
+    /// Readable. A new index is first write-only: writers maintain it while it
+    /// is backfilled, readers ignore it (the F1 / CockroachDB schema-change states).
+    pub public: bool,
 }
 
 /// What `ANALYZE` measured.
@@ -99,7 +102,7 @@ impl Table {
 
     fn encode(&self) -> Vec<u8> {
         let mut w = W::new();
-        w.u8(1)
+        w.u8(2)
             .u32(self.id)
             .bytes(self.name.as_bytes())
             .u32(self.columns.len() as u32);
@@ -125,6 +128,7 @@ impl Table {
             w.u32(ix.id)
                 .bytes(ix.name.as_bytes())
                 .u8(u8::from(ix.unique))
+                .u8(u8::from(ix.public))
                 .u32(ix.columns.len() as u32);
             for &c in &ix.columns {
                 w.u32(c as u32);
@@ -154,7 +158,7 @@ impl Table {
             String::from_utf8(b).map_err(|_| Error::Internal("corrupt descriptor".into()))
         };
         let mut r = R(b);
-        let _version = r.u8().map_err(e)?;
+        let version = r.u8().map_err(e)?;
         let id = r.u32().map_err(e)?;
         let name = s(r.bytes().map_err(e)?)?;
         let n = r.u32().map_err(e)? as usize;
@@ -188,6 +192,11 @@ impl Table {
             let id = r.u32().map_err(e)?;
             let name = s(r.bytes().map_err(e)?)?;
             let unique = r.u8().map_err(e)? == 1;
+            let public = if version >= 2 {
+                r.u8().map_err(e)? == 1
+            } else {
+                true
+            };
             let cols = (0..r.u32().map_err(e)?)
                 .map(|_| r.u32().map(|x| x as usize))
                 .collect::<std::result::Result<_, _>>()
@@ -197,6 +206,7 @@ impl Table {
                 name,
                 columns: cols,
                 unique,
+                public,
             });
         }
         let next_index_id = r.u32().map_err(e)?;
@@ -318,6 +328,7 @@ mod tests {
                 name: "orders_note".into(),
                 columns: vec![1],
                 unique: false,
+                public: true,
             }],
             next_index_id: 3,
             stats: Some(Stats {

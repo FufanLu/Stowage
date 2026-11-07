@@ -8,7 +8,7 @@ pub mod server;
 pub mod testing;
 pub mod wire;
 
-pub use client::{ClientError, KvClient, Txn, TxnError};
+pub use client::{Changefeed, ClientError, KvClient, Txn, TxnError};
 pub use server::{NodeConfig, run};
 
 /// Parse `1=host:port,2=host:port,...`.

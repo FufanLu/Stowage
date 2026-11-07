@@ -16,7 +16,7 @@ pub mod store;
 pub mod txn;
 pub mod types;
 
-pub use msg::{KvError, PeerMsg, Request, Response};
+pub use msg::{Change, KvError, PeerMsg, Request, Response};
 pub use store::{Staged, Store, StoreConfig, StoreStats, Token};
 pub use types::{RangeDescriptor, RangeId, RangeInfo};
 

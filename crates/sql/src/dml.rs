@@ -433,13 +433,20 @@ pub async fn create_table(b: &mut Binder<'_>, ct: &ast::CreateTable) -> Result<(
             name: ix_name,
             columns: cols,
             unique: true,
+            public: true,
         });
         t.next_index_id += 1;
     }
     catalog::put_table(b.txn, &t).await
 }
 
-pub async fn create_index(b: &mut Binder<'_>, ci: &ast::CreateIndex) -> Result<()> {
+/// Phase 1 of `CREATE INDEX`: add the index as write-only. From the moment this
+/// commits, every write maintains it; no read uses it yet. Returns the table and
+/// index id, or `None` if it exists and `IF NOT EXISTS` was given.
+pub async fn create_index_start(
+    b: &mut Binder<'_>,
+    ci: &ast::CreateIndex,
+) -> Result<Option<(String, u32)>> {
     let table = object_name(&ci.table_name)?;
     let mut t = catalog::table(b.txn, &table).await?;
     let cols: Vec<usize> = ci
@@ -464,30 +471,130 @@ pub async fn create_index(b: &mut Binder<'_>, ci: &ast::CreateIndex) -> Result<(
     };
     if t.indexes.iter().any(|i| i.name == name) {
         if ci.if_not_exists {
-            return Ok(());
+            return Ok(None);
         }
         return Err(Error::DuplicateObject(name));
     }
-    let ix = Index {
-        id: t.next_index_id,
+    let id = t.next_index_id;
+    t.indexes.push(Index {
+        id,
         name,
         columns: cols,
         unique: ci.unique,
-    };
+        public: false,
+    });
     t.next_index_id += 1;
-    // Backfill from the existing rows, in this transaction.
+    catalog::put_table(b.txn, &t).await?;
+    Ok(Some((table, id)))
+}
+
+/// Phase 2: index up to `batch` rows from `cursor` (a primary key, or the
+/// table's start). Returns where to continue, or `None` when done. Each batch is
+/// its own transaction: rows it read that a concurrent writer changes make it
+/// fail its refresh and run again, so it never writes a stale entry.
+pub async fn backfill_batch(
+    b: &mut Binder<'_>,
+    table: &str,
+    index: u32,
+    cursor: Option<Vec<u8>>,
+    batch: u32,
+) -> Result<(Option<Vec<u8>>, usize)> {
+    let t = catalog::table(b.txn, table).await?;
+    let ix = t
+        .indexes
+        .iter()
+        .find(|i| i.id == index)
+        .ok_or_else(|| Error::UndefinedObject(format!("index {index}")))?
+        .clone();
     let (start, end) = exec::span(&t, &Access::full());
-    let pairs = b.txn.scan(&start, &end, u32::MAX).await?;
-    for (key, v) in pairs {
-        let row = keycodec::decode_row(&v, t.columns.len())?;
+    let from = cursor.unwrap_or(start);
+    let pairs = b.txn.scan(&from, &end, batch).await?;
+    let n = pairs.len();
+    for (key, v) in &pairs {
+        let row = keycodec::decode_row(v, t.columns.len())?;
         let (k, unique) = t.index_key(&ix, &row);
-        if unique && b.txn.get(&k).await?.is_some() {
+        if unique
+            && let Some(existing) = b.txn.get(&k).await?
+            && existing != *key
+        {
             return Err(Error::UniqueViolation(ix.name.clone()));
         }
-        b.txn.put(&k, if unique { &key } else { &[] }).await?;
+        b.txn.put(&k, if unique { key } else { &[] }).await?;
     }
-    t.indexes.push(ix);
+    Ok(match pairs.last() {
+        Some((k, _)) if n == batch as usize => {
+            let mut next = k.clone();
+            next.push(0);
+            (Some(next), n)
+        }
+        _ => (None, n),
+    })
+}
+
+/// Phase 3: make the index readable.
+pub async fn create_index_finish(b: &mut Binder<'_>, table: &str, index: u32) -> Result<()> {
+    let mut t = catalog::table(b.txn, table).await?;
+    if let Some(ix) = t.indexes.iter_mut().find(|i| i.id == index) {
+        ix.public = true;
+    }
     catalog::put_table(b.txn, &t).await
+}
+
+/// A failed build: remove the index and whatever entries it has.
+pub async fn create_index_abort(b: &mut Binder<'_>, table: &str, index: u32) -> Result<()> {
+    let mut t = catalog::table(b.txn, table).await?;
+    t.indexes.retain(|i| i.id != index);
+    let start = keycodec::index_prefix(t.id, index);
+    let end = keycodec::prefix_end(&start);
+    for (k, _) in b.txn.scan(&start, &end, u32::MAX).await? {
+        b.txn.delete(&k).await?;
+    }
+    catalog::put_table(b.txn, &t).await
+}
+
+/// Compare an index with its table: (rows, entries, problems). Every row must
+/// have exactly the entry its values imply, and no entry may lack a row.
+pub async fn check_index(
+    txn: &mut dyn KvTxn,
+    table: &str,
+    index_name: &str,
+) -> Result<(usize, usize, Vec<String>)> {
+    let t = catalog::table(txn, table).await?;
+    let ix = t
+        .indexes
+        .iter()
+        .find(|i| i.name == index_name)
+        .ok_or_else(|| Error::UndefinedObject(index_name.to_owned()))?
+        .clone();
+    let (start, end) = exec::span(&t, &Access::full());
+    let rows = txn.scan(&start, &end, u32::MAX).await?;
+    let mut want = std::collections::BTreeMap::new();
+    for (key, v) in &rows {
+        let row = keycodec::decode_row(v, t.columns.len())?;
+        let (k, unique) = t.index_key(&ix, &row);
+        want.insert(k, if unique { key.clone() } else { Vec::new() });
+    }
+    let start = keycodec::index_prefix(t.id, ix.id);
+    let end = keycodec::prefix_end(&start);
+    let have: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = txn
+        .scan(&start, &end, u32::MAX)
+        .await?
+        .into_iter()
+        .collect();
+    let mut problems = Vec::new();
+    for (k, v) in &want {
+        match have.get(k) {
+            None => problems.push(format!("missing entry {k:02x?}")),
+            Some(h) if h != v => problems.push(format!("entry {k:02x?} points elsewhere")),
+            Some(_) => {}
+        }
+    }
+    for k in have.keys() {
+        if !want.contains_key(k) {
+            problems.push(format!("stray entry {k:02x?}"));
+        }
+    }
+    Ok((rows.len(), have.len(), problems))
 }
 
 pub async fn drop(

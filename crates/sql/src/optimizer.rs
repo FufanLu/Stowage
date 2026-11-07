@@ -778,6 +778,8 @@ fn choose_access(table: &Table, cols: &[ColId], filter: &Expr) -> Access {
         table
             .indexes
             .iter()
+            // Only public indexes are readable; write-only ones are being built.
+            .filter(|ix| ix.public)
             .map(|ix| (ix.id, ix.columns.clone(), true)),
     );
     for (index, key_cols, secondary) in candidates {

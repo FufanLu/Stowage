@@ -84,6 +84,38 @@ pub struct Session {
     pub retries: u64,
     /// Where the last statement spent its time: (stage, milliseconds).
     pub timings: Vec<(&'static str, f64)>,
+    /// Steps of the last online schema change, with milliseconds since it began.
+    pub schema_log: Vec<(f64, String)>,
+}
+
+/// Run `$body` (which may use the binder `$b`) in its own transaction, retrying
+/// on serialization conflicts.
+macro_rules! own_txn {
+    ($self:ident, $b:ident, $body:expr) => {{
+        let mut attempt = 0;
+        loop {
+            let mut txn = $self.store.begin($self.isolation).await?;
+            let r = {
+                let mut $b = Binder::new(txn.as_mut(), Vec::new(), now_micros());
+                $body.await
+            };
+            let r = match r {
+                Ok(v) => txn.commit().await.map(|()| v),
+                Err(e) => {
+                    let _ = txn.rollback().await;
+                    Err(e)
+                }
+            };
+            match r {
+                Err(Error::Retry(_)) if attempt < AUTOCOMMIT_RETRIES => {
+                    attempt += 1;
+                    $self.retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(attempt as u64 * 5)).await;
+                }
+                r => break r,
+            }
+        }
+    }};
 }
 
 impl std::fmt::Debug for Session {
@@ -132,6 +164,7 @@ impl Session {
             rng: Xoshiro256::from_entropy(),
             retries: 0,
             timings: Vec::new(),
+            schema_log: Vec::new(),
         }
     }
 
@@ -222,6 +255,7 @@ impl Session {
                 text_rows(&name, vec![v])
             }
             _ if self.failed => Err(Error::InFailedTransaction),
+            Statement::CreateIndex(ci) if self.txn.is_none() => self.create_index_online(ci).await,
             _ => {
                 if self.txn.is_some() {
                     let r = self.in_txn(stmt, params).await;
@@ -270,6 +304,62 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// `CREATE INDEX` outside a transaction block, online (F1 states):
+    /// 1. one transaction adds the index **write-only**: writes maintain it, reads ignore it;
+    /// 2. the existing rows are backfilled in small transactions;
+    /// 3. one transaction makes it **public**.
+    ///
+    /// Writers are never blocked for longer than one batch.
+    async fn create_index_online(&mut self, ci: &ast::CreateIndex) -> Result<Output> {
+        let t0 = Instant::now();
+        self.schema_log.clear();
+        let batch: u32 = self
+            .var("index_backfill_batch")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+        let Some((table, ix)) = own_txn!(self, b, dml::create_index_start(&mut b, ci))? else {
+            return Ok(Output::Command("CREATE INDEX".into()));
+        };
+        self.schema_log
+            .push((ms(t0), format!("index {ix} on {table} added write-only")));
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut total = 0usize;
+        let mut batches = 0usize;
+        loop {
+            let from = cursor.clone();
+            let r = own_txn!(
+                self,
+                b,
+                dml::backfill_batch(&mut b, &table, ix, from.clone(), batch)
+            );
+            let (next, n) = match r {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = own_txn!(self, b, dml::create_index_abort(&mut b, &table, ix));
+                    self.schema_log
+                        .push((ms(t0), format!("build failed ({e}); index removed")));
+                    return Err(e);
+                }
+            };
+            total += n;
+            batches += 1;
+            self.schema_log.push((
+                ms(t0),
+                format!("backfill batch {batches}: {n} rows ({total} so far)"),
+            ));
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        own_txn!(self, b, dml::create_index_finish(&mut b, &table, ix))?;
+        self.schema_log.push((
+            ms(t0),
+            format!("index {ix} public after {total} rows in {batches} batches"),
+        ));
+        Ok(Output::Command("CREATE INDEX".into()))
     }
 
     fn set(&mut self, set: &ast::Set) -> Result<Output> {
@@ -388,7 +478,19 @@ impl Session {
                 Ok(Output::Command("CREATE TABLE".into()))
             }
             Statement::CreateIndex(ci) => {
-                dml::create_index(&mut b, ci).await?;
+                // Inside a transaction block: every phase in this transaction.
+                if let Some((table, ix)) = dml::create_index_start(&mut b, ci).await? {
+                    let mut cursor = None;
+                    loop {
+                        let (next, _) =
+                            dml::backfill_batch(&mut b, &table, ix, cursor, u32::MAX).await?;
+                        if next.is_none() {
+                            break;
+                        }
+                        cursor = next;
+                    }
+                    dml::create_index_finish(&mut b, &table, ix).await?;
+                }
                 Ok(Output::Command("CREATE INDEX".into()))
             }
             Statement::Drop {
