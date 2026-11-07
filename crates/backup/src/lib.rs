@@ -259,11 +259,11 @@ pub struct Restored {
     pub as_of: String,
 }
 
+/// Key → value: the live keys at one moment.
+pub type State = BTreeMap<Vec<u8>, Vec<u8>>;
+
 /// The state as of `as_of` (inclusive) according to the backups in `src`.
-pub fn state_as_of(
-    src: &Path,
-    as_of: Timestamp,
-) -> Result<(BTreeMap<Vec<u8>, Vec<u8>>, usize, u64)> {
+pub fn state_as_of(src: &Path, as_of: Timestamp) -> Result<(State, usize, u64)> {
     let backups = list(src)?;
     let first_full = backups
         .iter()
