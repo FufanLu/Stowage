@@ -16,6 +16,8 @@ pub struct Binder<'t> {
     pub params: Vec<Option<String>>,
     /// `now()`, fixed for the statement (microseconds since the epoch).
     pub now: i64,
+    /// The authenticated user; `None` when authentication is off.
+    pub user: Option<crate::auth::User>,
 }
 
 pub fn unsupported<T>(what: impl std::fmt::Display) -> Result<T> {
@@ -148,6 +150,7 @@ impl<'t> Binder<'t> {
             next_col: 1,
             params,
             now,
+            user: None,
         }
     }
 
@@ -161,8 +164,26 @@ impl<'t> Binder<'t> {
         (0..n).map(|_| self.col_id()).collect()
     }
 
-    /// A scan of `name` under `alias`.
+    /// Fail unless the session's user holds `privilege` on `table`.
+    pub fn require(&self, table: &str, privilege: &str) -> Result<()> {
+        match &self.user {
+            Some(u) if !u.may(table, privilege) => {
+                crate::audit::record(
+                    "permission_denied",
+                    &u.name,
+                    &format!("{privilege} on {table}"),
+                );
+                Err(Error::PermissionDenied(format!("for table {table}")))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A scan of `name` under `alias`. Every read of a table comes through
+    /// here, subqueries and the WHERE of UPDATE and DELETE included, so this is
+    /// where SELECT is checked.
     pub async fn scan(&mut self, name: &str, alias: Option<String>) -> Result<Plan> {
+        self.require(name, "SELECT")?;
         let table = catalog::table(self.txn, name).await?;
         let cols = self.new_cols(table.columns.len());
         Ok(Plan::Scan {

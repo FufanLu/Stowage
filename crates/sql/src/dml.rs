@@ -108,6 +108,7 @@ pub async fn insert(b: &mut Binder<'_>, ins: &ast::Insert, rng: &mut dyn Rng) ->
         }
         Some(other) => return unsupported(format!("{other}")),
     };
+    b.require(&name, "INSERT")?;
     let t = catalog::table(b.txn, &name).await?;
     let targets: Vec<usize> = if ins.columns.is_empty() {
         t.visible_columns().map(|(i, _)| i).collect()
@@ -202,6 +203,7 @@ pub async fn update(b: &mut Binder<'_>, u: &ast::Update) -> Result<u64> {
         return unsupported("UPDATE … FROM / RETURNING");
     }
     let (name, alias) = target_table(&u.table)?;
+    b.require(&name, "UPDATE")?;
     let (plan, rows) = matching_rows(b, &name, alias, u.selection.as_ref()).await?;
     let Plan::Scan { table: t, .. } = find_scan(&plan) else {
         return Err(Error::Internal("update without scan".into()));
@@ -300,6 +302,7 @@ pub async fn delete(b: &mut Binder<'_>, d: &ast::Delete) -> Result<u64> {
         return unsupported("DELETE from several tables");
     };
     let (name, alias) = target_table(twj)?;
+    b.require(&name, "DELETE")?;
     let (plan, rows) = matching_rows(b, &name, alias, d.selection.as_ref()).await?;
     let Plan::Scan { table: t, .. } = find_scan(&plan) else {
         return Err(Error::Internal("delete without scan".into()));

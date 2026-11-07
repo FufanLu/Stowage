@@ -10,6 +10,8 @@
 //! primary key ([`keycodec`]); their descriptors too ([`catalog`]). Every
 //! statement runs in an interactive transaction (SSI by default).
 
+pub mod audit;
+pub mod auth;
 pub mod binder;
 pub mod catalog;
 pub mod dml;
@@ -68,6 +70,8 @@ pub enum Error {
     Kv(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("permission denied {0}")]
+    PermissionDenied(String),
 }
 
 impl Error {
@@ -93,6 +97,7 @@ impl Error {
             Self::InFailedTransaction => "25P02",
             Self::Kv(_) => "58000",
             Self::Internal(_) => "XX000",
+            Self::PermissionDenied(_) => "42501",
         }
     }
 }

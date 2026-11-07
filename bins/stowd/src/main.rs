@@ -59,6 +59,10 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:5480", env = "STOWAGE_PG_LISTEN")]
     pg_listen: String,
 
+    /// Append audit records (logins, privilege failures, DDL, grants) to this file.
+    #[arg(long)]
+    audit_log: Option<PathBuf>,
+
     /// DynamoDB-compatible API listener (HTTP); empty to disable.
     #[arg(long, default_value = "127.0.0.1:8480", env = "STOWAGE_DDB_LISTEN")]
     ddb_listen: String,
@@ -94,6 +98,9 @@ async fn main() -> anyhow::Result<()> {
         ..BTreeOptions::default()
     };
     tracing::info!(node = args.node_id, ?peers, data_dir = %args.data_dir.display(), "starting stowd");
+    if let Some(p) = &args.audit_log {
+        stowage_sql::audit::init(p).context("--audit-log")?;
+    }
     if !args.ddb_listen.is_empty() {
         let client = std::sync::Arc::new(stowage_node::KvClient::new(peers.clone()));
         let store: std::sync::Arc<dyn stowage_sql::KvStore> =

@@ -170,6 +170,7 @@ fn binary(v: &Value) -> Option<Vec<u8>> {
 }
 
 struct Conn {
+    store: Arc<dyn KvStore>,
     rd: tokio::net::tcp::OwnedReadHalf,
     wr: BufWriter<tokio::net::tcp::OwnedWriteHalf>,
     session: Session,
@@ -184,6 +185,7 @@ impl Conn {
     fn new(sock: TcpStream, store: Arc<dyn KvStore>, pid: u32) -> Self {
         let (rd, wr) = sock.into_split();
         Self {
+            store: store.clone(),
             rd,
             wr: BufWriter::new(wr),
             session: Session::new(store),
@@ -255,6 +257,28 @@ impl Conn {
                         params.insert(k, b.cstr()?);
                     }
                     tracing::debug!(?params, "pg startup");
+                    let user = params.get("user").cloned().unwrap_or_default();
+                    let required = match stowage_sql::auth::required(&self.store).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            self.error_raw("58000", &e.to_string()).await?;
+                            return Ok(false);
+                        }
+                    };
+                    if required {
+                        if !self.scram(&user).await? {
+                            stowage_sql::audit::record("login_failed", &user, "SCRAM-SHA-256");
+                            self.error_raw(
+                                "28P01",
+                                &format!("password authentication failed for user \"{user}\""),
+                            )
+                            .await?;
+                            self.wr.flush().await?;
+                            return Ok(false);
+                        }
+                        stowage_sql::audit::record("login", &user, "SCRAM-SHA-256");
+                        self.session.set_user(Some(user.clone()));
+                    }
                     self.send(Msg::new(b'R').i32(0)).await?; // AuthenticationOk
                     for (k, v) in [
                         ("server_version", "16.0"),
@@ -282,6 +306,85 @@ impl Conn {
                     return Ok(false);
                 }
             }
+        }
+    }
+
+    /// SCRAM-SHA-256 (RFC 5802 / 7677), the exchange Postgres uses:
+    /// client-first → server-first (nonce, salt, iterations) → client-final with
+    /// a proof → server-final with the server's signature.
+    async fn scram(&mut self, user: &str) -> std::io::Result<bool> {
+        use stowage_sql::auth;
+        self.send(Msg::new(b'R').i32(10).cstr("SCRAM-SHA-256").byte(0))
+            .await?;
+        self.wr.flush().await?;
+        let (kind, body) = self.read_frame().await?;
+        if kind != b'p' {
+            return Ok(false);
+        }
+        let mut b = Body(&body);
+        let mech = b.cstr()?;
+        let len = b.i32()?;
+        let first =
+            String::from_utf8_lossy(&b.take(usize::try_from(len).map_err(|_| Body::err())?)?)
+                .into_owned();
+        // gs2 header "n,," (no channel binding), then "n=…,r=<client nonce>".
+        let Some(bare) = first.splitn(3, ',').nth(2).map(str::to_owned) else {
+            return Ok(false);
+        };
+        let Some(cnonce) = bare
+            .split(',')
+            .find_map(|f| f.strip_prefix("r="))
+            .map(str::to_owned)
+        else {
+            return Ok(false);
+        };
+        let rec = match auth::lookup(&self.store, user).await {
+            Ok(Some(u)) if u.login => u.scram,
+            _ => None,
+        };
+        // Unknown users get a full exchange with a made-up salt, so a client
+        // cannot tell them from a wrong password.
+        let secret = rec.clone().unwrap_or_else(|| {
+            auth::scram_secret(
+                &format!("{:x?}", auth::random_salt()),
+                &auth::random_salt(),
+                auth::ITERATIONS,
+            )
+        });
+        let snonce = format!("{cnonce}{}", auth::b64_public(&auth::random_salt()));
+        let server_first = format!("r={snonce},s={},i={}", secret.salt, secret.iterations);
+        if mech != "SCRAM-SHA-256" {
+            return Ok(false);
+        }
+        self.send(Msg::new(b'R').i32(11).bytes(server_first.as_bytes()))
+            .await?;
+        self.wr.flush().await?;
+        let (kind, body) = self.read_frame().await?;
+        if kind != b'p' {
+            return Ok(false);
+        }
+        let fin = String::from_utf8_lossy(&body).into_owned();
+        let Some((without_proof, proof)) = fin.rsplit_once(",p=") else {
+            return Ok(false);
+        };
+        if !without_proof.split(',').any(|f| f == format!("r={snonce}")) {
+            return Ok(false);
+        }
+        let Some(proof) = auth::unb64(proof) else {
+            return Ok(false);
+        };
+        let auth_message = format!("{bare},{server_first},{without_proof}");
+        match (rec, auth::scram_verify(&secret, &auth_message, &proof)) {
+            (Some(_), Some(sig)) => {
+                self.send(
+                    Msg::new(b'R')
+                        .i32(12)
+                        .bytes(format!("v={}", auth::b64_public(&sig)).as_bytes()),
+                )
+                .await?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 

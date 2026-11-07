@@ -86,6 +86,10 @@ pub struct Session {
     pub timings: Vec<(&'static str, f64)>,
     /// Steps of the last online schema change, with milliseconds since it began.
     pub schema_log: Vec<(f64, String)>,
+    /// The authenticated user (pgwire sets it); `None` when authentication is off.
+    user_name: Option<String>,
+    /// Its record, re-read before every statement so grants apply at once.
+    user: Option<crate::auth::User>,
 }
 
 /// Run `$body` (which may use the binder `$b`) in its own transaction, retrying
@@ -129,7 +133,60 @@ impl std::fmt::Debug for Session {
 const AUTOCOMMIT_RETRIES: usize = 20;
 
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
-    Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(|e| Error::Parse(e.to_string()))
+    Parser::parse_sql(&PostgreSqlDialect {}, &user_as_role(sql))
+        .map_err(|e| Error::Parse(e.to_string()))
+}
+
+/// Postgres' `CREATE/ALTER/DROP USER` are `… ROLE` (with LOGIN); the parser
+/// knows only the ROLE forms. Rewrites the keyword outside quotes.
+fn user_as_role(sql: &str) -> std::borrow::Cow<'_, str> {
+    let upper = sql.to_ascii_uppercase();
+    if !upper.contains(" USER") {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0; // sql[..copied] is in `out`
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            quote = Some(c);
+            i += 1;
+            continue;
+        }
+        let boundary = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        let hit = ["CREATE USER", "ALTER USER", "DROP USER"]
+            .into_iter()
+            .find(|p| {
+                boundary
+                    && upper[i..].starts_with(p)
+                    && upper
+                        .as_bytes()
+                        .get(i + p.len())
+                        .is_none_or(|x| !x.is_ascii_alphanumeric() && *x != b'_')
+            });
+        match hit {
+            Some(p) => {
+                let verb = p.len() - " USER".len();
+                out.push_str(&sql[copied..i + verb]);
+                out.push_str(" ROLE");
+                i += p.len();
+                copied = i;
+            }
+            None => i += 1,
+        }
+    }
+    out.push_str(&sql[copied..]);
+    std::borrow::Cow::Owned(out)
 }
 
 fn now_micros() -> i64 {
@@ -165,7 +222,18 @@ impl Session {
             retries: 0,
             timings: Vec::new(),
             schema_log: Vec::new(),
+            user_name: None,
+            user: None,
         }
+    }
+
+    /// Run as `name` (after it authenticated). `None`: no checks.
+    pub fn set_user(&mut self, name: Option<String>) {
+        self.user_name = name;
+    }
+
+    fn who(&self) -> &str {
+        self.user_name.as_deref().unwrap_or("-")
     }
 
     pub fn status(&self) -> TxStatus {
@@ -192,6 +260,35 @@ impl Session {
     /// Run one statement with `$n` parameters (the extended protocol).
     pub async fn run(&mut self, stmt: &Statement, params: &[Option<String>]) -> Result<Output> {
         self.timings.clear();
+        if let Some(name) = self.user_name.clone() {
+            let mut t = self.store.begin(Isolation::Serializable).await?;
+            let u = crate::auth::get_user(t.as_mut(), &name).await;
+            let _ = t.rollback().await;
+            self.user = Some(u?.ok_or_else(|| Error::UndefinedObject(format!("role \"{name}\"")))?);
+        }
+        let admin = matches!(
+            stmt,
+            Statement::CreateTable(_)
+                | Statement::CreateIndex(_)
+                | Statement::Drop { .. }
+                | Statement::Analyze(_)
+                | Statement::CreateRole(_)
+                | Statement::AlterRole { .. }
+                | Statement::Grant(_)
+                | Statement::Revoke(_)
+        );
+        if admin {
+            if let Some(u) = &self.user
+                && !u.superuser
+            {
+                crate::audit::record("permission_denied", &u.name, &summary(stmt));
+                return Err(Error::PermissionDenied(format!(
+                    "to run {}: superuser required",
+                    summary(stmt)
+                )));
+            }
+            crate::audit::record("ddl", self.who(), &summary(stmt));
+        }
         match stmt {
             Statement::StartTransaction { modes, .. } => {
                 if self.txn.is_some() || self.failed {
@@ -415,7 +512,53 @@ impl Session {
             .ok_or_else(|| Error::Internal("no transaction".into()))?
             .as_mut();
         let mut b = Binder::new(txn, params.to_vec(), now);
+        b.user = self.user.clone();
         match stmt {
+            Statement::CreateRole(cr) => {
+                crate::auth::create_role(b.txn, cr).await?;
+                Ok(Output::Command("CREATE ROLE".into()))
+            }
+            Statement::AlterRole { name, operation } => {
+                crate::auth::alter_role(b.txn, name, operation).await?;
+                Ok(Output::Command("ALTER ROLE".into()))
+            }
+            Statement::Drop {
+                object_type: ast::ObjectType::Role | ast::ObjectType::User,
+                names,
+                if_exists,
+                ..
+            } => {
+                for n in names {
+                    let name = object_name(n)?;
+                    if crate::auth::get_user(b.txn, &name).await?.is_none() {
+                        if *if_exists {
+                            continue;
+                        }
+                        return Err(Error::UndefinedObject(format!("role \"{name}\"")));
+                    }
+                    crate::auth::drop_user(b.txn, &name).await?;
+                }
+                Ok(Output::Command("DROP ROLE".into()))
+            }
+            Statement::Grant(g) => {
+                let d =
+                    crate::auth::grant(b.txn, &g.privileges, g.objects.as_ref(), &g.grantees, true)
+                        .await?;
+                crate::audit::record("grant", self.user_name.as_deref().unwrap_or("-"), &d);
+                Ok(Output::Command("GRANT".into()))
+            }
+            Statement::Revoke(r) => {
+                let d = crate::auth::grant(
+                    b.txn,
+                    &r.privileges,
+                    r.objects.as_ref(),
+                    &r.grantees,
+                    false,
+                )
+                .await?;
+                crate::audit::record("revoke", self.user_name.as_deref().unwrap_or("-"), &d);
+                Ok(Output::Command("REVOKE".into()))
+            }
             Statement::Query(q) => {
                 let t = Instant::now();
                 let bound = b.bind_query(q).await?;
@@ -563,6 +706,17 @@ impl Session {
     }
 }
 
+/// The first words of a statement, for audit records and errors.
+fn summary(stmt: &Statement) -> String {
+    let s = stmt.to_string();
+    // Never log a password.
+    let s = match s.to_ascii_uppercase().find("PASSWORD") {
+        Some(i) => format!("{} PASSWORD '***'", s[..i].trim_end()),
+        None => s,
+    };
+    s.chars().take(200).collect()
+}
+
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
@@ -602,4 +756,23 @@ fn text_rows(name: &str, lines: Vec<String>) -> Result<Output> {
         columns: vec![(name.to_owned(), DataType::Text)],
         batch,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn user_statements_become_role_statements() {
+        assert_eq!(
+            super::user_as_role("create user a with password 'héllo USER'"),
+            "create ROLE a with password 'héllo USER'"
+        );
+        assert_eq!(
+            super::user_as_role("ALTER USER b WITH PASSWORD 'x'; DROP USER IF EXISTS c"),
+            "ALTER ROLE b WITH PASSWORD 'x'; DROP ROLE IF EXISTS c"
+        );
+        assert_eq!(
+            super::user_as_role("SELECT current_user, 'CREATE USER x' FROM users"),
+            "SELECT current_user, 'CREATE USER x' FROM users"
+        );
+    }
 }
