@@ -19,6 +19,7 @@ mod disk;
 mod seeds;
 mod world;
 
+pub mod elle;
 pub mod linearizability;
 
 pub use clock::{SimClock, SimTime};

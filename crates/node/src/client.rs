@@ -7,14 +7,18 @@
 //!
 //! Writes are never retried after they may have been proposed: a timeout or an
 //! `Ambiguous` reply is returned to the caller, who knows whether re-applying the
-//! write is safe.
+//! write is safe. Transactions ([`KvClient::transact`]) are different: every
+//! request a transaction coordinator sends is idempotent, so all of them are
+//! retried.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use stowage_common::NodeId;
+use stowage_common::os::{SystemClock, Xoshiro256};
+use stowage_common::{Hlc, NodeId, Rng, Timestamp};
+use stowage_kv::txn::{Isolation, Outcome, Program, TxnCoord};
 use stowage_kv::{KvError, RangeInfo, Request, Response};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
@@ -50,6 +54,8 @@ pub struct KvClient {
     conns: Mutex<HashMap<NodeId, Arc<Conn>>>,
     ranges: std::sync::Mutex<BTreeMap<Vec<u8>, RangeInfo>>,
     next_token: AtomicU64,
+    hlc: Hlc,
+    rng: std::sync::Mutex<Xoshiro256>,
     pub timeout: Duration,
 }
 
@@ -60,6 +66,8 @@ impl KvClient {
             conns: Mutex::new(HashMap::new()),
             ranges: std::sync::Mutex::new(BTreeMap::new()),
             next_token: AtomicU64::new(1),
+            hlc: Hlc::new(Arc::new(SystemClock), 500_000_000),
+            rng: std::sync::Mutex::new(Xoshiro256::from_entropy()),
             timeout: Duration::from_secs(3),
         }
     }
@@ -178,11 +186,18 @@ impl KvClient {
     /// redirects. Reads are retried on any error; writes only while they cannot
     /// have been proposed.
     pub async fn request(&self, req: Request) -> Result<Response, ClientError> {
-        let key = req.routing_key().unwrap_or_default().to_vec();
         let is_write = matches!(
             req,
             Request::Put { .. } | Request::Delete { .. } | Request::Split { .. }
         );
+        self.route(req, !is_write).await
+    }
+
+    /// [`Self::request`], with `idempotent` deciding whether a request that may
+    /// have been proposed can be sent again.
+    async fn route(&self, req: Request, idempotent: bool) -> Result<Response, ClientError> {
+        let key = req.routing_key().unwrap_or_default().to_vec();
+        let is_write = !idempotent;
         let nodes = self.nodes();
         let mut target = self.cached(&key).unwrap_or(nodes[0]);
         let mut last_err = String::new();
@@ -201,7 +216,10 @@ impl KvClient {
                 }
             };
             match resp {
-                Response::Error(KvError::Ambiguous) => return Err(ClientError::Ambiguous),
+                Response::Error(KvError::Ambiguous) if is_write => {
+                    return Err(ClientError::Ambiguous);
+                }
+                Response::Error(KvError::Ambiguous) => last_err = "ambiguous".into(),
                 Response::Error(KvError::NotLeader {
                     leader: Some(l), ..
                 }) if l != target => {
@@ -317,5 +335,74 @@ impl KvClient {
             }
         }
         Err(ClientError::Exhausted(0, "no node answered".into()))
+    }
+
+    /// Run `program` as one transaction and return how it ended. The coordinator
+    /// state machine is the one the simulator tests ([`TxnCoord`]); this drives it
+    /// over the network: each request goes to its range's leader in its own task,
+    /// and a 10 ms tick handles backoff and heartbeats.
+    pub async fn transact(
+        self: &Arc<Self>,
+        isolation: Isolation,
+        program: Program,
+    ) -> Result<Outcome, ClientError> {
+        let (id, priority) = {
+            let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                u128::from(rng.next_u64()) << 64 | u128::from(rng.next_u64()),
+                u32::try_from(rng.next_u64() % (1 << 20)).unwrap_or(1),
+            )
+        };
+        let mut coord = TxnCoord::new(id, self.hlc.now(), priority, isolation, program);
+        let (tx, mut rx) =
+            mpsc::unbounded_channel::<(u64, Request, Result<Response, ClientError>)>();
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            for o in coord.take_requests() {
+                let (c, tx) = (self.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let resp = c.route(o.req.clone(), true).await;
+                    let _ = tx.send((o.tag, o.req, resp));
+                });
+            }
+            if coord.is_done() {
+                return coord
+                    .outcome
+                    .clone()
+                    .ok_or_else(|| ClientError::Exhausted(0, "no outcome".into()));
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err(ClientError::Timeout);
+            }
+            tokio::select! {
+                Some((tag, req, resp)) = rx.recv() => {
+                    let resp = resp?;
+                    self.observe(&resp);
+                    coord.on_response(tag, &req, resp, self.hlc.now());
+                }
+                _ = tick.tick() => coord.tick(self.hlc.now()),
+            }
+        }
+    }
+
+    fn observe(&self, resp: &Response) {
+        let seen = |ts: Timestamp| {
+            if ts.wall < Timestamp::MAX.wall {
+                let _ = self.hlc.update(ts);
+            }
+        };
+        match resp {
+            Response::Written(ts) | Response::WriteTooOld(ts) => seen(*ts),
+            Response::Txn {
+                commit_ts,
+                min_commit_ts,
+                ..
+            } => {
+                seen(*commit_ts);
+                seen(*min_commit_ts);
+            }
+            _ => {}
+        }
     }
 }

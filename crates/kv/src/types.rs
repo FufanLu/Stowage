@@ -2,9 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use stowage_common::NodeId;
+use stowage_common::{NodeId, Timestamp};
 
 use crate::codec::{R, W};
+use crate::mvcc::{TxnMeta, get_ts, put_ts};
 use crate::{Error, Result};
 
 pub type RangeId = u64;
@@ -125,13 +126,62 @@ pub struct ProposalId {
     pub seq: u64,
 }
 
-/// A command in a range's Raft log.
+/// How a transaction record is pushed by a conflicting reader or writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushKind {
+    /// A reader at `ts` with `priority` ran into the intent: if the owner is
+    /// abandoned it is aborted; if the reader's priority is higher the owner may
+    /// no longer commit at or below `ts` (so the read can ignore the intent);
+    /// otherwise the reader waits.
+    Timestamp { ts: Timestamp, priority: u32 },
+    /// A writer with `priority` ran into the intent: abort the owner if it is
+    /// abandoned or has a lower priority.
+    Abort { priority: u32 },
+}
+
+/// A command in a range's Raft log. Timestamps and wall-clock values are chosen by
+/// the proposing leader and carried in the command, so applying it is a pure
+/// function of the command and the engine state: every replica gets the same result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Atomic batch of puts (`Some`) and deletes (`None`) within one range.
-    Write {
+    /// Write `value` (`None` deletes) at `ts`. Without `txn` it commits at once
+    /// (at `ts`, or just above the newest version); with `txn` it lays down an
+    /// intent owned by that transaction.
+    Put {
         pid: ProposalId,
-        ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+        ts: Timestamp,
+        txn: Option<TxnMeta>,
+    },
+    /// Commit (at `commit_ts`) or abort a transaction: update its record.
+    EndTxn {
+        pid: ProposalId,
+        txn: TxnMeta,
+        commit: bool,
+        commit_ts: Timestamp,
+        now_wall: u64,
+    },
+    /// Turn `txn_id`'s intent on `key` into a committed version, or remove it.
+    Resolve {
+        pid: ProposalId,
+        key: Vec<u8>,
+        txn_id: u128,
+        commit: bool,
+        commit_ts: Timestamp,
+    },
+    /// Push the owner of a conflicting intent.
+    Push {
+        pid: ProposalId,
+        pushee: TxnMeta,
+        kind: PushKind,
+        now_wall: u64,
+    },
+    /// The coordinator is alive.
+    Heartbeat {
+        pid: ProposalId,
+        txn: TxnMeta,
+        now_wall: u64,
     },
     /// Split at `key`; the right half becomes range `new_id`. Applies only if the
     /// range is still at `generation` (otherwise it was already split or changed).
@@ -146,12 +196,83 @@ pub enum Command {
 impl Command {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W::new();
+        let pid = self.pid();
         match self {
-            Command::Write { pid, ops } => {
-                w.u8(1).u64(pid.node).u64(pid.seq).u32(ops.len() as u32);
-                for (k, v) in ops {
-                    w.bytes(k).opt_bytes(v.as_deref());
+            Command::Put {
+                key,
+                value,
+                ts,
+                txn,
+                ..
+            } => {
+                w.u8(1)
+                    .u64(pid.node)
+                    .u64(pid.seq)
+                    .bytes(key)
+                    .opt_bytes(value.as_deref());
+                put_ts(&mut w, *ts);
+                match txn {
+                    None => w.u8(0),
+                    Some(t) => {
+                        w.u8(1);
+                        t.encode(&mut w);
+                        &mut w
+                    }
+                };
+            }
+            Command::EndTxn {
+                txn,
+                commit,
+                commit_ts,
+                now_wall,
+                ..
+            } => {
+                w.u8(3).u64(pid.node).u64(pid.seq);
+                txn.encode(&mut w);
+                w.u8(u8::from(*commit));
+                put_ts(&mut w, *commit_ts);
+                w.u64(*now_wall);
+            }
+            Command::Resolve {
+                key,
+                txn_id,
+                commit,
+                commit_ts,
+                ..
+            } => {
+                w.u8(4)
+                    .u64(pid.node)
+                    .u64(pid.seq)
+                    .bytes(key)
+                    .u64((txn_id >> 64) as u64)
+                    .u64(*txn_id as u64);
+                w.u8(u8::from(*commit));
+                put_ts(&mut w, *commit_ts);
+            }
+            Command::Push {
+                pushee,
+                kind,
+                now_wall,
+                ..
+            } => {
+                w.u8(5).u64(pid.node).u64(pid.seq);
+                pushee.encode(&mut w);
+                match kind {
+                    PushKind::Timestamp { ts, priority } => {
+                        w.u8(0);
+                        put_ts(&mut w, *ts);
+                        w.u32(*priority);
+                    }
+                    PushKind::Abort { priority } => {
+                        w.u8(1).u32(*priority);
+                    }
                 }
+                w.u64(*now_wall);
+            }
+            Command::Heartbeat { txn, now_wall, .. } => {
+                w.u8(6).u64(pid.node).u64(pid.seq);
+                txn.encode(&mut w);
+                w.u64(*now_wall);
             }
             Command::Split {
                 pid,
@@ -179,12 +300,68 @@ impl Command {
         };
         let c = match kind {
             1 => {
-                let n = r.u32()?;
-                let mut ops = Vec::with_capacity(usize::try_from(n.min(4096)).unwrap_or(0));
-                for _ in 0..n {
-                    ops.push((r.bytes()?, r.opt_bytes()?));
+                let key = r.bytes()?;
+                let value = r.opt_bytes()?;
+                let ts = get_ts(&mut r)?;
+                let txn = match r.u8()? {
+                    0 => None,
+                    _ => Some(TxnMeta::decode(&mut r)?),
+                };
+                Command::Put {
+                    pid,
+                    key,
+                    value,
+                    ts,
+                    txn,
                 }
-                Command::Write { pid, ops }
+            }
+            3 => {
+                let txn = TxnMeta::decode(&mut r)?;
+                let commit = r.u8()? == 1;
+                Command::EndTxn {
+                    pid,
+                    txn,
+                    commit,
+                    commit_ts: get_ts(&mut r)?,
+                    now_wall: r.u64()?,
+                }
+            }
+            4 => {
+                let key = r.bytes()?;
+                let hi = r.u64()?;
+                let lo = r.u64()?;
+                let commit = r.u8()? == 1;
+                Command::Resolve {
+                    pid,
+                    key,
+                    txn_id: (u128::from(hi) << 64) | u128::from(lo),
+                    commit,
+                    commit_ts: get_ts(&mut r)?,
+                }
+            }
+            5 => {
+                let pushee = TxnMeta::decode(&mut r)?;
+                let kind = match r.u8()? {
+                    0 => PushKind::Timestamp {
+                        ts: get_ts(&mut r)?,
+                        priority: r.u32()?,
+                    },
+                    _ => PushKind::Abort { priority: r.u32()? },
+                };
+                Command::Push {
+                    pid,
+                    pushee,
+                    kind,
+                    now_wall: r.u64()?,
+                }
+            }
+            6 => {
+                let txn = TxnMeta::decode(&mut r)?;
+                Command::Heartbeat {
+                    pid,
+                    txn,
+                    now_wall: r.u64()?,
+                }
             }
             2 => Command::Split {
                 pid,
@@ -200,7 +377,12 @@ impl Command {
 
     pub fn pid(&self) -> ProposalId {
         match self {
-            Command::Write { pid, .. } | Command::Split { pid, .. } => *pid,
+            Command::Put { pid, .. }
+            | Command::EndTxn { pid, .. }
+            | Command::Resolve { pid, .. }
+            | Command::Push { pid, .. }
+            | Command::Heartbeat { pid, .. }
+            | Command::Split { pid, .. } => *pid,
         }
     }
 }
@@ -235,43 +417,17 @@ impl SnapshotData {
     }
 }
 
-/// Engine key layout. Everything lives in one B+Tree per node:
+/// Node-local metadata keys. User data lives under the [`crate::mvcc`] prefixes
+/// (`'d'` versions, `'i'` intents, `'x'` transaction records); ranges partition
+/// those by user key, so a split moves no data.
 ///
 /// ```text
-///  'd' ‖ user_key                      user data (any range)
 ///  'l' ‖ "desc"    ‖ range_id (BE)     a local replica's descriptor
 ///  'l' ‖ "applied" ‖ range_id (BE)     its applied Raft index
 ///  'l' ‖ "rangeseq"                    this node's range-id allocator
 ///  'l' ‖ "incarnation"                 bumped at every open; prefixes proposal ids
 /// ```
-///
-/// Ranges partition only the `'d'` space, so a split moves no data: both halves
-/// keep reading the same keys from the same engine.
 pub mod keys {
-    pub const DATA: u8 = b'd';
-
-    pub fn data(user_key: &[u8]) -> Vec<u8> {
-        let mut k = Vec::with_capacity(1 + user_key.len());
-        k.push(DATA);
-        k.extend_from_slice(user_key);
-        k
-    }
-
-    pub fn user(engine_key: &[u8]) -> &[u8] {
-        &engine_key[1..]
-    }
-
-    /// Engine-key bounds of the user span `[start, end)`.
-    pub fn span(start: &[u8], end: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let lo = data(start);
-        let hi = if end.is_empty() {
-            vec![DATA + 1]
-        } else {
-            data(end)
-        };
-        (lo, hi)
-    }
-
     fn local(kind: &str, id: u64) -> Vec<u8> {
         let mut k = vec![b'l'];
         k.extend_from_slice(kind.as_bytes());
@@ -321,9 +477,32 @@ mod tests {
         assert_eq!(RangeDescriptor::from_bytes(&desc.to_bytes()).unwrap(), desc);
         let pid = ProposalId { node: 2, seq: 9 };
         for c in [
-            Command::Write {
+            Command::Put {
                 pid,
-                ops: vec![(b"k".to_vec(), Some(b"v".to_vec())), (b"x".to_vec(), None)],
+                key: b"k".to_vec(),
+                value: Some(b"v".to_vec()),
+                ts: Timestamp::new(9, 1),
+                txn: Some(TxnMeta {
+                    id: 7,
+                    anchor: b"a".to_vec(),
+                    epoch: 0,
+                    write_ts: Timestamp::new(9, 1),
+                    start_wall: 3,
+                    priority: 5,
+                }),
+            },
+            Command::Push {
+                pid,
+                pushee: TxnMeta {
+                    id: 1,
+                    anchor: vec![],
+                    epoch: 0,
+                    write_ts: Timestamp::MIN,
+                    start_wall: 0,
+                    priority: 0,
+                },
+                kind: PushKind::Abort { priority: 9 },
+                now_wall: 4,
             },
             Command::Split {
                 pid,
@@ -339,12 +518,5 @@ mod tests {
             pairs: vec![(b"a".to_vec(), b"1".to_vec())],
         };
         assert_eq!(SnapshotData::decode(&s.encode()).unwrap(), s);
-    }
-
-    #[test]
-    fn data_keys_sort_inside_their_span() {
-        let (lo, hi) = keys::span(b"", b"");
-        assert!(keys::data(b"") >= lo && keys::data(b"\xff\xff") < hi);
-        assert!(keys::desc(1) < lo || keys::desc(1) >= hi);
     }
 }

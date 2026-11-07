@@ -166,15 +166,18 @@ fn main() {
     );
     for id in 1..=3 {
         let n = sim.actor(id).unwrap();
-        let pairs = n.store.scan_local(&right).unwrap();
+        let keys: Vec<String> = n
+            .store
+            .scan_local(&right)
+            .unwrap()
+            .iter()
+            .filter_map(|(k, _)| stowage_kv::mvcc::decode_version_key(k).ok())
+            .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
+            .collect();
         println!(
-            "  n{id} holds {} pairs for {} — no data moved: {:?}",
-            pairs.len(),
-            short_range(right.id),
-            pairs
-                .iter()
-                .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
-                .collect::<Vec<_>>()
+            "  n{id} holds {} keys for {} — no data moved: {keys:?}",
+            keys.len(),
+            short_range(right.id)
         );
     }
 

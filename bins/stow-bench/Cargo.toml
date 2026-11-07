@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 stowage-common.workspace = true
 stowage-node.workspace = true
+stowage-kv.workspace = true
 tokio.workspace = true
 stowage-storage = { workspace = true, features = ["lsm"] }
 anyhow.workspace = true

@@ -46,7 +46,7 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | M1 | B+Tree、buffer pool、WAL、恢复 | ✅ |
 | M2 | Raft（pre-vote、lease、snapshot、成员变更） | ✅ |
 | M3 | Multi-Raft：range、分裂、再均衡、共享 Raft 日志、TCP 集群 + Docker compose | ✅ |
-| M4 | 分布式事务、SI / SSI | ⏳ |
+| M4 | 分布式事务、SI / SSI | ✅ |
 | M5 | SQL 引擎 + Postgres 协议 | |
 | M6 | DynamoDB API、CDC、在线 schema 变更 | |
 | M7 | 安全、备份/PITR、配额、可观测性 | |
@@ -79,6 +79,10 @@ cargo run --release -p stowctl -- ranges
 ```
 
 range 会自动分裂，并在节点之间迁移。调度器不是独立服务，由 range 1 的 leader 兼任。在同一台笔记本上用 Docker Desktop 跑 Linux 三节点：50% 写、64 个客户端时为 1.7–2.5k ops/s；256 个客户端时最高 4.9k ops/s（[图解 04](docs/illustrated/04-a-range-splits.md)，[基准](docs/benchmarks.md#m3--three-node-cluster)）。
+
+### 事务一览（M4）
+
+跨 range 事务，采用 CockroachDB 的做法：HLC 时间戳、MVCC write intent，以及一条事务记录（记录翻成 `Committed` 那一刻就是提交点）。隔离级别按事务选 SI 或 SSI。仿真中用 Elle 风格的检查器验证：SSI 下没有任何依赖环，SI 下只出现 write skew。在真实三节点集群上，`stow-bench bank` 跑转账加审计，并回放每一笔已提交的转账来校验；中途 `kill -9` 一个节点，钱依然守恒。开发过程中抓到 9 个 bug，其中一个只有真实集群才暴露出来（[图解 05](docs/illustrated/05-a-transfer-transaction.md)，[ADR 0007](docs/adr/0007-transactions.md)）。
 
 ## 快速开始
 

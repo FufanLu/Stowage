@@ -7,10 +7,13 @@
 //! whichever node leads range 1.
 
 pub mod codec;
+pub mod eval;
 pub mod msg;
+pub mod mvcc;
 pub mod prefix_disk;
 pub mod routing;
 pub mod store;
+pub mod txn;
 pub mod types;
 
 pub use msg::{KvError, PeerMsg, Request, Response};

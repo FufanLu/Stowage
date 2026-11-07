@@ -35,9 +35,8 @@ why it is CP.
 | `stowage-storage` | B+Tree, buffer pool, WAL, recovery; fjall LSM adapter (feature `lsm`) for comparison | M1 |
 | `stow-bench` | benchmarks (`engine` today; YCSB and cluster workloads later) | M1 |
 | `stowage-raft` | Raft core as a pure state machine; `DiskStorage`; joint consensus; ReadIndex/lease reads | M2 |
-| `stowage-kv` | ranges, Multi-Raft store, splits, routing, scheduler | M3 |
+| `stowage-kv` | ranges, Multi-Raft store, splits, routing, scheduler; MVCC, intents, transaction records, timestamp cache, the transaction coordinator | M3–M4 |
 | `stowage-node`, `stowctl` | TCP runtime, async client, CLI | M3 |
-| `stowage-txn` | MVCC, intents, coordinator, timestamp cache, deadlock detection | M4 |
 | `stowage-sql`, `stowage-pgwire` | SQL engine and Postgres protocol | M5 |
 | `stowage-docapi`, `stowage-cdc` | DynamoDB API, changefeeds, backup / PITR | M6–M7 |
 
@@ -127,11 +126,41 @@ See [ADR 0004](adr/0004-btree-redo-logging.md) for the reasoning.
 - [ADR 0006](adr/0006-multi-raft-ranges.md),
   [chapter 04](illustrated/04-a-range-splits.md).
 
+## Transactions (M4)
+
+- **MVCC in the shared engine.** `'d' ‖ esc(key) ‖ !ts` versions (newest first),
+  `'i' ‖ esc(key)` write intents, `'x' ‖ esc(anchor) ‖ id` transaction records.
+  All sort into the owning range, so splits and snapshots carry them unchanged.
+- **Timestamps.** HLC everywhere: on every request and every Raft message. A leader
+  puts each write above its **timestamp cache**, which records the highest read
+  per key and span when the read *arrives*. A read waits for every write that
+  arrived before it, including writes queued for the next proposal batch.
+- **Commit.** One Raft command flips the record on the anchor's range to
+  `Committed`. Resolving intents afterwards is cleanup that anyone may do.
+- **Conflicts.** Readers push a writer's `min_commit_ts`; writers abort lower
+  priorities; both wait for higher ones. Abandoned records (no heartbeat for
+  2 s) are aborted.
+- **Isolation.** SI refreshes written keys over `(read_ts, commit_ts]` before
+  committing higher; SSI refreshes read keys too. A failed refresh restarts the
+  transaction.
+- **Coordinator.** `TxnCoord`, a pure state machine driven by the simulator's
+  driver and by `KvClient::transact` over TCP. Every request is idempotent.
+- **Verification.**
+  - Bank-transfer invariants and Elle-style list-append histories, checked under
+    the nemesis on fixed and random seeds.
+  - A replica divergence checker in the simulations: every node must produce the
+    same engine writes for each (range, index).
+  - `stow-bench bank`, which replays the committed transfers of a real cluster
+    run.
+- [ADR 0007](adr/0007-transactions.md),
+  [chapter 05](illustrated/05-a-transfer-transaction.md).
+
 ## Status
 
 M0: workspace, environment traits, HLC and the simulator are in place.
 M1: storage engine, with crash tests and benchmarks.
 M2: single-group Raft with simulation, scenario and mutation testing.
 M3: Multi-Raft key-value layer, TCP cluster, Docker compose.
+M4: distributed transactions (SI and SSI) on MVCC, verified in simulation and on a real cluster.
 Later sections of this document are filled in as each milestone lands. The
 [illustrated chapters](illustrated/README.md) show each piece with real data.

@@ -53,7 +53,7 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | M1 | B+Tree, buffer pool, WAL, recovery | ✅ |
 | M2 | Raft (pre-vote, leases, snapshots, membership change) | ✅ |
 | M3 | Multi-Raft: ranges, splits, rebalancing, shared Raft log, TCP cluster + Docker compose | ✅ |
-| M4 | distributed transactions, SI / SSI | ⏳ |
+| M4 | distributed transactions, SI / SSI | ✅ |
 | M5 | SQL engine + Postgres wire protocol | |
 | M6 | DynamoDB API, CDC, online schema change | |
 | M7 | security, backup / PITR, quotas, observability | |
@@ -96,6 +96,18 @@ Desktop, three nodes on one laptop do 1.7–2.5 k ops/s (50 % writes, 64 clients
 and up to 4.9 k ops/s with 256 clients
 ([chapter 04](docs/illustrated/04-a-range-splits.md),
 [benchmarks](docs/benchmarks.md#m3--three-node-cluster)).
+
+### Transactions at a glance (M4)
+
+Multi-range transactions in CockroachDB's style: HLC timestamps, MVCC write
+intents, a transaction record whose flip to `Committed` is the commit point, and
+SI or SSI per transaction. In simulation, an Elle-style checker finds no
+dependency cycle under SSI and only write skew under SI. On a real three-node
+cluster, `stow-bench bank` (transfers and audits, with a replay check of every
+committed transfer) conserves money through a `kill -9`. Nine bugs were found on
+the way, one of which only the real cluster showed
+([chapter 05](docs/illustrated/05-a-transfer-transaction.md),
+[ADR 0007](docs/adr/0007-transactions.md)).
 
 ## Quick start
 

@@ -12,18 +12,19 @@
 //!
 //! The same code runs inside the simulator and in `stowd`'s tokio driver.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
-use stowage_common::{Disk, NodeId};
+use stowage_common::{Clock, Disk, Hlc, NodeId, Timestamp};
 use stowage_raft::types::SnapshotMeta;
 use stowage_raft::{
     Body, Config as RaftConfig, Entry, EntryKind, LogBatch, LogEngine, Membership, Message, Raft,
     ReadMode, SharedStorage, Snapshot, Storage as _,
 };
-use stowage_storage::{BTree, BTreeOptions, Engine as _, WriteBatch};
+use stowage_storage::{BTree, BTreeOptions, WriteBatch};
 
+use crate::eval::{self, TsCache};
 use crate::msg::{KvError, PeerMsg, Request, Response};
 use crate::prefix_disk::PrefixDisk;
 use crate::routing::Routing;
@@ -60,6 +61,8 @@ pub struct StoreConfig {
     /// Enable automatic size-based splits and the scheduler.
     pub auto_split: bool,
     pub rebalance: bool,
+    /// Bound on clock disagreement between nodes (HLC), nanoseconds.
+    pub max_offset_nanos: u64,
 }
 
 impl StoreConfig {
@@ -79,6 +82,7 @@ impl StoreConfig {
             engine: BTreeOptions::default(),
             auto_split: true,
             rebalance: true,
+            max_offset_nanos: 250_000_000,
         }
     }
 }
@@ -96,14 +100,27 @@ pub struct StoreStats {
     pub schedule_ops: u64,
 }
 
+struct PendingRead {
+    token: Token,
+    req: Request,
+    ts: Timestamp,
+    /// Serve only once applied >= this (the last index when the read arrived).
+    wait: u64,
+}
+
 struct Replica {
     desc: RangeDescriptor,
     raft: Raft<SharedStorage>,
     applied: u64,
     batch: Vec<Command>,
-    waiting: HashMap<u64, Token>,
-    reads: BTreeMap<u64, (Token, Request)>,
+    waiting: BTreeMap<u64, Token>,
+    /// Reads waiting for leadership confirmation (ReadIndex)...
+    reads: BTreeMap<u64, PendingRead>,
+    /// ...and then for every write proposed before them to apply.
+    confirmed: Vec<PendingRead>,
     next_read: u64,
+    tscache: TsCache,
+    was_leader: bool,
     approx_bytes: u64,
     since_compact: u64,
     split_pending_until: u64,
@@ -127,8 +144,98 @@ pub struct Staged {
     pub responses: Vec<(Token, Response)>,
 }
 
+/// Replica divergence checking for simulations. When enabled (per thread: one
+/// simulation runs on one thread), every applied entry's command *and the engine
+/// writes it produced* are fingerprinted per (range, index); a node that applies
+/// the same position differently panics. Raft guarantees the same log everywhere;
+/// this checks that the state machine on top stays deterministic, which a bad
+/// snapshot or a replica applying on top of the wrong state breaks.
+#[doc(hidden)]
+pub mod divergence {
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    use stowage_common::NodeId;
+
+    use crate::types::RangeId;
+
+    #[derive(Default)]
+    struct State {
+        applied: BTreeMap<(RangeId, u64), (NodeId, u64)>,
+        events: VecDeque<String>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    pub fn enable() {
+        STATE.with(|s| *s.borrow_mut() = Some(State::default()));
+    }
+
+    pub(crate) fn enabled() -> bool {
+        STATE.with(|s| s.borrow().is_some())
+    }
+
+    /// Remember a replica lifecycle event (printed if divergence is found).
+    pub(crate) fn event(f: impl FnOnce() -> String) {
+        STATE.with(|s| {
+            if let Some(st) = s.borrow_mut().as_mut() {
+                if st.events.len() == 500 {
+                    st.events.pop_front();
+                }
+                st.events.push_back(f());
+            }
+        });
+    }
+
+    pub(crate) fn applied(node: NodeId, range: RangeId, index: u64, what: &str) {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            let Some(st) = s.as_mut() else { return };
+            let mut h = DefaultHasher::new();
+            what.hash(&mut h);
+            let fp = h.finish();
+            let (first, prev) = *st.applied.entry((range, index)).or_insert((node, fp));
+            if prev != fp {
+                for e in &st.events {
+                    eprintln!("  event: {e}");
+                }
+                panic!("replica divergence: n{node} applied range {range} index {index} differently from n{first}:\n{what}");
+            }
+        });
+    }
+}
+
+use divergence::event;
+
+/// Propose a replica's queued commands as one Raft entry batch, failing them
+/// back to their clients if this replica cannot propose.
+fn propose_batch(r: &mut Replica, stats: &mut StoreStats, client_out: &mut Vec<(Token, Response)>) {
+    let cmds = std::mem::take(&mut r.batch);
+    stats.batches += 1;
+    stats.proposals += cmds.len() as u64;
+    let encoded = cmds.iter().map(Command::encode).collect();
+    if r.raft.propose(encoded).is_err() {
+        for c in cmds {
+            if let Some(t) = r.waiting.remove(&c.pid().seq) {
+                let leader = r.raft.leader();
+                client_out.push((
+                    t,
+                    Response::Error(KvError::NotLeader {
+                        range: r.desc.id,
+                        leader,
+                    }),
+                ));
+            }
+        }
+    }
+}
+
 pub struct Store {
     cfg: StoreConfig,
+    hlc: Hlc,
     engine: BTree,
     /// One Raft log for every replica on this node: one fsync per batch.
     log: LogEngine,
@@ -170,7 +277,7 @@ fn storage_err(e: impl std::fmt::Display) -> Error {
 }
 
 impl Store {
-    pub fn open(cfg: StoreConfig, disk: Arc<dyn Disk>) -> Result<Self> {
+    pub fn open(cfg: StoreConfig, disk: Arc<dyn Disk>, clock: Arc<dyn Clock>) -> Result<Self> {
         let engine_disk: Arc<dyn Disk> = Arc::new(PrefixDisk::new(disk.clone(), "e."));
         let (engine, _) = BTree::open(engine_disk, cfg.engine.clone()).map_err(storage_err)?;
         let log = LogEngine::open(Arc::new(PrefixDisk::new(disk.clone(), "raft.")))
@@ -199,6 +306,7 @@ impl Store {
         );
         engine.write(&b, true).map_err(storage_err)?;
         let mut store = Self {
+            hlc: Hlc::new(clock, cfg.max_offset_nanos),
             cfg,
             engine,
             log,
@@ -228,6 +336,7 @@ impl Store {
             })
             .collect::<Result<_>>()?;
         for d in descs {
+            event(|| format!("n{} reopens {}", store.cfg.node, d));
             store.open_replica(d, false)?;
         }
         // Raft state without a descriptor: the engine lost an unsynced descriptor
@@ -288,8 +397,9 @@ impl Store {
             .map_or(0, |v| {
                 u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0; 8]))
             });
-        let raft = Raft::new(raft_config(self.cfg.node, id, self.cfg.read_mode), storage)
+        let mut raft = Raft::new(raft_config(self.cfg.node, id, self.cfg.read_mode), storage)
             .map_err(storage_err)?;
+        raft.restore_applied(applied);
         let approx_bytes = self.measure(&desc)?;
         self.dirty.insert(id);
         self.replicas.insert(
@@ -299,9 +409,12 @@ impl Store {
                 raft,
                 applied,
                 batch: Vec::new(),
-                waiting: HashMap::new(),
+                waiting: BTreeMap::new(),
                 reads: BTreeMap::new(),
+                confirmed: Vec::new(),
                 next_read: 1,
+                tscache: TsCache::default(),
+                was_leader: false,
                 approx_bytes,
                 since_compact: 0,
                 split_pending_until: 0,
@@ -316,6 +429,7 @@ impl Store {
 
     /// A placeholder replica that will be filled by an incoming snapshot.
     fn open_uninitialized(&mut self, id: RangeId) -> Result<()> {
+        event(|| format!("n{} open uninitialized {id}", self.cfg.node));
         let desc = RangeDescriptor {
             id,
             start: Vec::new(),
@@ -337,9 +451,12 @@ impl Store {
                 raft,
                 applied: 0,
                 batch: Vec::new(),
-                waiting: HashMap::new(),
+                waiting: BTreeMap::new(),
                 reads: BTreeMap::new(),
+                confirmed: Vec::new(),
                 next_read: 1,
+                tscache: TsCache::default(),
+                was_leader: false,
                 approx_bytes: 0,
                 since_compact: 0,
                 split_pending_until: 0,
@@ -352,13 +469,7 @@ impl Store {
     }
 
     fn measure(&self, desc: &RangeDescriptor) -> Result<u64> {
-        let (lo, hi) = keys::span(&desc.start, &desc.end);
-        let mut n = 0u64;
-        for kv in self.engine.iter(Bound::Included(&lo), Bound::Excluded(&hi)) {
-            let (k, v) = kv.map_err(storage_err)?;
-            n += (k.len() + v.len()) as u64;
-        }
-        Ok(n)
+        eval::range_bytes(&self.engine, desc)
     }
 
     // ---- accessors --------------------------------------------------------------
@@ -383,16 +494,10 @@ impl Store {
             .map(|r| (r.desc.clone(), r.raft.is_leader(), r.raft.term(), r.applied))
             .collect()
     }
-    /// Every user pair this node stores for `desc`'s span.
+    /// Every engine pair this node stores for `desc` (versions, intents and
+    /// transaction records): what a snapshot carries, and what tests compare.
     pub fn scan_local(&self, desc: &RangeDescriptor) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let (lo, hi) = keys::span(&desc.start, &desc.end);
-        self.engine
-            .iter(Bound::Included(&lo), Bound::Excluded(&hi))
-            .map(|kv| {
-                kv.map(|(k, v)| (keys::user(&k).to_vec(), v))
-                    .map_err(storage_err)
-            })
-            .collect()
+        eval::range_pairs(&self.engine, desc)
     }
 
     /// Ids of every replica, including uninitialized ones (debugging).
@@ -400,8 +505,7 @@ impl Store {
         self.replicas.keys().copied().collect()
     }
 
-    /// Debug view of one replica's Raft state: (role, term, commit, last index,
-    /// snapshot index, [(peer, match, next)]).
+    /// Debug view of one replica's Raft state.
     pub fn raft_debug(&self, id: RangeId) -> Option<String> {
         let r = self.replicas.get(&id)?;
         Some(format!(
@@ -418,6 +522,14 @@ impl Store {
             r.raft.progress(),
             r.raft.stats()
         ))
+    }
+
+    /// The latest committed value of `key` as stored locally (tests, examples).
+    pub fn local_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match eval::get(&self.engine, key, Timestamp::MAX, None, &[])? {
+            Response::Value(v) => Ok(v),
+            _ => Ok(None),
+        }
     }
 
     /// Everything ready to leave the node, together with the log bytes it depends
@@ -528,7 +640,10 @@ impl Store {
 
     pub fn handle_peer(&mut self, from: NodeId, msg: PeerMsg) -> Result<()> {
         match msg {
-            PeerMsg::Raft { range, msg } => self.raft_message(from, range, msg)?,
+            PeerMsg::Raft { range, msg, ts } => {
+                let _ = self.hlc.update(ts);
+                self.raft_message(from, range, msg)?;
+            }
             PeerMsg::Heartbeat { node, ranges } => {
                 self.routing.store_seen(node, self.ticks);
                 for info in ranges {
@@ -659,12 +774,65 @@ impl Store {
             ));
             return Ok(());
         }
+        let now = self.hlc.now();
         match req {
-            Request::Get { .. } | Request::Scan { .. } => {
+            Request::Get { .. }
+            | Request::Scan { .. }
+            | Request::TxnGet { .. }
+            | Request::TxnScan { .. }
+            | Request::Refresh { .. } => {
+                // Non-transactional reads see the latest state; transactional ones
+                // read at the transaction's timestamp (which the clock observes).
+                // Non-transactional reads take the latest committed state: they
+                // wait for every write proposed before them (below), so this is
+                // linearizable without comparing timestamps.
+                let ts = match &req {
+                    Request::TxnGet { ts, .. } | Request::TxnScan { ts, .. } => {
+                        let _ = self.hlc.update(*ts);
+                        *ts
+                    }
+                    Request::Refresh { to, .. } => {
+                        let _ = self.hlc.update(*to);
+                        *to
+                    }
+                    _ => Timestamp::MAX,
+                };
+                // Record the read in the timestamp cache now, on arrival: a write
+                // evaluated while this read waits for its barrier must already land
+                // above it. (A refresh is a read at `to` of its span.)
+                let cache_ts = if ts == Timestamp::MAX { now } else { ts };
+                match &req {
+                    Request::Get { key } | Request::TxnGet { key, .. } => {
+                        r.tscache.record_point(key, cache_ts)
+                    }
+                    Request::Scan { start, end, .. }
+                    | Request::TxnScan { start, end, .. }
+                    | Request::Refresh { start, end, .. } => {
+                        r.tscache.record_span(start, end, cache_ts);
+                    }
+                    _ => {}
+                }
                 let rid = r.next_read;
                 r.next_read += 1;
                 self.dirty.insert(id);
-                r.reads.insert(rid, (token, req));
+                // Wait for every write that arrived before this read: one with a
+                // lower timestamp could otherwise appear in the snapshot later.
+                // Writes still queued for the next batch got their timestamps
+                // before this read entered the timestamp cache, so propose them
+                // now and wait for them too.
+                if !r.batch.is_empty() {
+                    propose_batch(r, &mut self.stats, &mut self.client_out);
+                }
+                let wait = r.raft.last_index();
+                r.reads.insert(
+                    rid,
+                    PendingRead {
+                        token,
+                        req,
+                        ts,
+                        wait,
+                    },
+                );
                 if r.raft.read(rid).is_err() {
                     r.reads.remove(&rid);
                     self.client_out.push((
@@ -677,24 +845,116 @@ impl Store {
                 }
             }
             Request::Put { key, value } => {
+                let ts = now.max(r.tscache.max_read(&key).next());
+                let _ = self.hlc.update(ts);
                 let pid = self.alloc_pid();
                 self.push_command(
                     id,
                     token,
-                    Command::Write {
+                    Command::Put {
                         pid,
-                        ops: vec![(key, Some(value))],
+                        key,
+                        value: Some(value),
+                        ts,
+                        txn: None,
                     },
                 );
             }
             Request::Delete { key } => {
+                let ts = now.max(r.tscache.max_read(&key).next());
+                let _ = self.hlc.update(ts);
                 let pid = self.alloc_pid();
                 self.push_command(
                     id,
                     token,
-                    Command::Write {
+                    Command::Put {
                         pid,
-                        ops: vec![(key, None)],
+                        key,
+                        value: None,
+                        ts,
+                        txn: None,
+                    },
+                );
+            }
+            Request::TxnPut { key, value, txn } => {
+                let _ = self.hlc.update(txn.write_ts);
+                // A write below a read already served would change that read:
+                // move it above (the coordinator then refreshes under SSI).
+                let ts = txn.write_ts.max(r.tscache.max_read(&key).next());
+                let _ = self.hlc.update(ts);
+                let pid = self.alloc_pid();
+                self.push_command(
+                    id,
+                    token,
+                    Command::Put {
+                        pid,
+                        key,
+                        value,
+                        ts,
+                        txn: Some(txn),
+                    },
+                );
+            }
+            Request::EndTxn {
+                txn,
+                commit,
+                commit_ts,
+            } => {
+                let _ = self.hlc.update(commit_ts);
+                let pid = self.alloc_pid();
+                self.push_command(
+                    id,
+                    token,
+                    Command::EndTxn {
+                        pid,
+                        txn,
+                        commit,
+                        commit_ts,
+                        now_wall: now.wall,
+                    },
+                );
+            }
+            Request::Resolve {
+                key,
+                txn_id,
+                commit,
+                commit_ts,
+            } => {
+                let pid = self.alloc_pid();
+                self.push_command(
+                    id,
+                    token,
+                    Command::Resolve {
+                        pid,
+                        key,
+                        txn_id,
+                        commit,
+                        commit_ts,
+                    },
+                );
+            }
+            Request::Push { pushee, kind } => {
+                let pid = self.alloc_pid();
+                self.push_command(
+                    id,
+                    token,
+                    Command::Push {
+                        pid,
+                        pushee,
+                        kind,
+                        now_wall: now.wall,
+                    },
+                );
+            }
+            Request::Heartbeat { txn } => {
+                let pid = self.alloc_pid();
+                self.push_command(
+                    id,
+                    token,
+                    Command::Heartbeat {
+                        pid,
+                        txn,
+                        now_wall: now.wall,
                     },
                 );
             }
@@ -756,27 +1016,9 @@ impl Store {
     /// fsync) per range. Drivers call this once per loop iteration.
     pub fn flush(&mut self) -> Result<()> {
         for r in self.replicas.values_mut() {
-            if r.batch.is_empty() {
-                continue;
-            }
-            let cmds = std::mem::take(&mut r.batch);
-            self.dirty.insert(r.desc.id);
-            self.stats.batches += 1;
-            self.stats.proposals += cmds.len() as u64;
-            let encoded = cmds.iter().map(Command::encode).collect();
-            if r.raft.propose(encoded).is_err() {
-                for c in cmds {
-                    if let Some(t) = r.waiting.remove(&c.pid().seq) {
-                        let leader = r.raft.leader();
-                        self.client_out.push((
-                            t,
-                            Response::Error(KvError::NotLeader {
-                                range: r.desc.id,
-                                leader,
-                            }),
-                        ));
-                    }
-                }
+            if !r.batch.is_empty() {
+                self.dirty.insert(r.desc.id);
+                propose_batch(r, &mut self.stats, &mut self.client_out);
             }
         }
         self.pump()
@@ -830,17 +1072,43 @@ impl Store {
                 }
             }
         }
+        // A new leader does not know which reads its predecessor served. It does
+        // know its clock is past all of them: the old leader confirmed each read
+        // with a quorum, our votes came from a quorum, and every Raft message
+        // carries the sender's HLC time. So forbid writes up to now.
+        let leading = r.raft.is_leader();
+        if leading && !r.was_leader {
+            let now = self.hlc.now();
+            r.tscache.reset(now);
+        }
+        r.was_leader = leading;
         for rid in r.raft.take_reads() {
-            if let Some((token, req)) = r.reads.remove(&rid) {
-                let resp = self.serve_read(&r.desc, &req)?;
-                self.client_out.push((token, resp));
+            if let Some(p) = r.reads.remove(&rid) {
+                r.confirmed.push(p); // leadership confirmed; now wait for `wait`
             }
+        }
+        let applied = r.applied;
+        let (ready, waiting): (Vec<PendingRead>, Vec<PendingRead>) =
+            std::mem::take(&mut r.confirmed)
+                .into_iter()
+                .partition(|p| p.wait <= applied);
+        r.confirmed = waiting;
+        for p in ready {
+            let resp = self.serve_read(r, &p)?;
+            self.client_out.push((p.token, resp));
         }
         // Reads and writes queued at a replica that lost leadership will never
         // complete here; fail them so clients retry at the new leader.
-        if !r.raft.is_leader() && (!r.reads.is_empty() || !r.waiting.is_empty()) {
+        if !r.raft.is_leader()
+            && (!r.reads.is_empty() || !r.confirmed.is_empty() || !r.waiting.is_empty())
+        {
             let leader = r.raft.leader();
-            for (_, (t, _)) in std::mem::take(&mut r.reads) {
+            let reads: Vec<Token> = std::mem::take(&mut r.reads)
+                .into_values()
+                .chain(std::mem::take(&mut r.confirmed))
+                .map(|p| p.token)
+                .collect();
+            for t in reads {
                 self.client_out.push((
                     t,
                     Response::Error(KvError::NotLeader {
@@ -867,7 +1135,9 @@ impl Store {
         {
             self.propose_split(r)?;
         }
-        if r.raft.is_leader() && !r.uninitialized {
+        // The snapshot is labelled with Raft's applied index and carries the
+        // engine's state: the two must agree.
+        if r.raft.is_leader() && !r.uninitialized && r.raft.applied() == r.applied {
             for to in r.raft.take_snapshot_requests() {
                 // Generated now, from the state as of the applied index.
                 let pairs = self.scan_local(&r.desc)?;
@@ -886,43 +1156,83 @@ impl Store {
                 PeerMsg::Raft {
                     range: r.desc.id,
                     msg: m,
+                    ts: self.hlc.now(),
                 },
             ));
         }
         Ok(())
     }
 
-    fn serve_read(&self, desc: &RangeDescriptor, req: &Request) -> Result<Response> {
-        Ok(match req {
-            Request::Get { key } => {
+    /// Evaluate a read whose leadership check and write barrier have passed, and
+    /// remember it in the timestamp cache so later writes land above it.
+    fn serve_read(&self, r: &mut Replica, p: &PendingRead) -> Result<Response> {
+        let desc = &r.desc;
+        let ts = p.ts;
+        let cache_ts = if ts == Timestamp::MAX {
+            self.hlc.now()
+        } else {
+            ts
+        };
+        Ok(match &p.req {
+            Request::Get { key } | Request::TxnGet { key, .. } => {
                 if !desc.contains(key) {
-                    Response::Error(KvError::KeyMoved)
-                } else {
-                    Response::Value(self.engine.get(&keys::data(key)).map_err(storage_err)?)
+                    return Ok(Response::Error(KvError::KeyMoved));
                 }
+                let (txn, skip) = match &p.req {
+                    Request::TxnGet { txn, skip, .. } => (*txn, skip.as_slice()),
+                    _ => (None, &[][..]),
+                };
+                r.tscache.record_point(key, cache_ts);
+                eval::get(&self.engine, key, ts, txn, skip)?
             }
-            Request::Scan { start, end, limit } => {
+            Request::Scan { start, end, limit }
+            | Request::TxnScan {
+                start, end, limit, ..
+            } => {
                 if !desc.contains(start) {
                     return Ok(Response::Error(KvError::KeyMoved));
                 }
-                let hi_user: &[u8] = if desc.end.is_empty() || (!end.is_empty() && end < &desc.end)
-                {
-                    end
-                } else {
-                    &desc.end
+                let (txn, skip) = match &p.req {
+                    Request::TxnScan { txn, skip, .. } => (*txn, skip.as_slice()),
+                    _ => (None, &[][..]),
                 };
-                let (lo, hi) = keys::span(start, hi_user);
-                let pairs = self
-                    .engine
-                    .scan(Bound::Included(&lo), Bound::Excluded(&hi), *limit as usize)
-                    .map_err(storage_err)?
-                    .into_iter()
-                    .map(|(k, v)| (keys::user(&k).to_vec(), v))
-                    .collect();
-                Response::Rows {
-                    pairs,
-                    range_end: desc.end.clone(),
+                let hi = if desc.end.is_empty() || (!end.is_empty() && end < &desc.end) {
+                    end.clone()
+                } else {
+                    desc.end.clone()
+                };
+                r.tscache.record_span(start, &hi, cache_ts);
+                eval::scan(
+                    &self.engine,
+                    desc,
+                    start,
+                    end,
+                    *limit as usize,
+                    ts,
+                    txn,
+                    skip,
+                )?
+            }
+            Request::Refresh {
+                start,
+                end,
+                from,
+                to,
+                txn,
+            } => {
+                if !desc.contains(start) {
+                    return Ok(Response::Error(KvError::KeyMoved));
                 }
+                let hi = if desc.end.is_empty() || (!end.is_empty() && end < &desc.end) {
+                    end.clone()
+                } else {
+                    desc.end.clone()
+                };
+                let ok = eval::refresh(&self.engine, start, &hi, *from, *to, *txn)?;
+                if ok {
+                    r.tscache.record_span(start, &hi, *to);
+                }
+                Response::Refreshed(ok)
             }
             _ => Response::Done,
         })
@@ -961,26 +1271,89 @@ impl Store {
                 }
             }
             EntryKind::Normal(data) => match Command::decode(data)? {
-                Command::Write { pid, ops } => {
-                    if ops.iter().all(|(k, _)| r.desc.contains(k)) {
-                        for (k, v) in ops {
-                            let size = (k.len() + v.as_ref().map_or(0, Vec::len) + 1) as u64;
-                            match v {
-                                Some(v) => {
-                                    r.approx_bytes += size;
-                                    b.put(keys::data(&k), v);
-                                }
-                                None => {
-                                    r.approx_bytes = r.approx_bytes.saturating_sub(size);
-                                    b.delete(keys::data(&k));
-                                }
-                            }
-                        }
-                        reply = (pid.node == self.cfg.node).then_some((pid.seq, Response::Done));
+                cmd @ (Command::Put { .. }
+                | Command::EndTxn { .. }
+                | Command::Resolve { .. }
+                | Command::Push { .. }
+                | Command::Heartbeat { .. }) => {
+                    let pid = cmd.pid();
+                    let routed: &[u8] = match &cmd {
+                        Command::Put { key, .. } | Command::Resolve { key, .. } => key,
+                        Command::EndTxn { txn, .. } | Command::Heartbeat { txn, .. } => &txn.anchor,
+                        Command::Push { pushee, .. } => &pushee.anchor,
+                        Command::Split { .. } => &[],
+                    };
+                    let resp = if !r.desc.contains(routed) {
+                        // The range split after this was proposed: retry at the new owner.
+                        Response::Error(KvError::KeyMoved)
                     } else {
-                        reply = (pid.node == self.cfg.node)
-                            .then_some((pid.seq, Response::Error(KvError::KeyMoved)));
-                    }
+                        let resp = match &cmd {
+                            Command::Put {
+                                key,
+                                value,
+                                ts,
+                                txn,
+                                ..
+                            } => {
+                                r.approx_bytes +=
+                                    (key.len() + value.as_ref().map_or(0, Vec::len) + 16) as u64;
+                                eval::put(
+                                    &self.engine,
+                                    key,
+                                    value.as_deref(),
+                                    *ts,
+                                    txn.as_ref(),
+                                    &mut b,
+                                )?
+                            }
+                            Command::EndTxn {
+                                txn,
+                                commit,
+                                commit_ts,
+                                now_wall,
+                                ..
+                            } => eval::end_txn(
+                                &self.engine,
+                                txn,
+                                *commit,
+                                *commit_ts,
+                                *now_wall,
+                                &mut b,
+                            )?,
+                            Command::Resolve {
+                                key,
+                                txn_id,
+                                commit,
+                                commit_ts,
+                                ..
+                            } => eval::resolve(
+                                &self.engine,
+                                key,
+                                *txn_id,
+                                *commit,
+                                *commit_ts,
+                                &mut b,
+                            )?,
+                            Command::Push {
+                                pushee,
+                                kind,
+                                now_wall,
+                                ..
+                            } => eval::push(&self.engine, pushee, *kind, *now_wall, &mut b)?,
+                            Command::Heartbeat { txn, now_wall, .. } => {
+                                eval::heartbeat(&self.engine, txn, *now_wall, &mut b)?
+                            }
+                            Command::Split { .. } => Response::Done,
+                        };
+                        // Non-transactional writes answer like before.
+                        match (&cmd, resp) {
+                            (Command::Put { txn: None, .. }, Response::Written(_)) => {
+                                Response::Done
+                            }
+                            (_, resp) => resp,
+                        }
+                    };
+                    reply = (pid.node == self.cfg.node).then_some((pid.seq, resp));
                 }
                 Command::Split {
                     pid,
@@ -1004,6 +1377,12 @@ impl Store {
                         b.put(keys::desc(id), r.desc.to_bytes());
                         b.put(keys::desc(new_id), right.to_bytes());
                         b.put(keys::applied(new_id), INIT_INDEX.to_le_bytes().to_vec());
+                        event(|| {
+                            format!(
+                                "n{} splits range {id} at index {} off {new_id}",
+                                self.cfg.node, e.index
+                            )
+                        });
                         new_range = Some(right);
                         self.stats.splits += 1;
                     }
@@ -1014,6 +1393,18 @@ impl Store {
         // A split creates the right half's Raft files (which are fsynced). Make the
         // descriptors durable first, so a crash can never leave Raft state for a
         // range the engine does not know about.
+        if divergence::enabled() {
+            let cmd = match &e.kind {
+                EntryKind::Normal(d) => format!("{:?}", Command::decode(d)),
+                k => format!("{k:?}"),
+            };
+            divergence::applied(
+                self.cfg.node,
+                id,
+                e.index,
+                &format!("term {} {cmd}\n  writes {:?}", e.term, b.ops()),
+            );
+        }
         self.engine
             .write(&b, new_range.is_some())
             .map_err(storage_err)?;
@@ -1066,16 +1457,20 @@ impl Store {
 
     fn install_snapshot(&mut self, r: &mut Replica, snap: &Snapshot) -> Result<()> {
         let data = SnapshotData::decode(&snap.data)?;
-        let (lo, hi) = keys::span(&data.desc.start, &data.desc.end);
+        event(|| {
+            format!(
+                "n{} installs a snapshot of {} at index {} (was at {})",
+                self.cfg.node, data.desc, snap.meta.index, r.applied
+            )
+        });
         let mut b = WriteBatch::new();
-        for kv in self.engine.iter(Bound::Included(&lo), Bound::Excluded(&hi)) {
-            let (k, _) = kv.map_err(storage_err)?;
+        for (k, _) in eval::range_pairs(&self.engine, &data.desc)? {
             b.delete(k);
         }
         let mut size = 0u64;
         for (k, v) in &data.pairs {
             size += (k.len() + v.len()) as u64;
-            b.put(keys::data(k), v.clone());
+            b.put(k.clone(), v.clone());
         }
         b.put(keys::desc(data.desc.id), data.desc.to_bytes());
         b.put(
@@ -1113,11 +1508,11 @@ impl Store {
     }
 
     fn propose_split(&mut self, r: &mut Replica) -> Result<()> {
-        let pairs = self.scan_local(&r.desc)?;
-        if pairs.len() < 2 {
+        let keys = eval::user_keys(&self.engine, &r.desc)?;
+        if keys.len() < 2 {
             return Ok(());
         }
-        let key = pairs[pairs.len() / 2].0.clone();
+        let key = keys[keys.len() / 2].clone();
         if key == r.desc.start {
             return Ok(());
         }
@@ -1139,16 +1534,20 @@ impl Store {
         let Some(r) = self.replicas.remove(&id) else {
             return Ok(());
         };
+        event(|| {
+            format!(
+                "n{} destroys {} (uninitialized: {})",
+                self.cfg.node, r.desc, r.uninitialized
+            )
+        });
         let mut b = WriteBatch::new();
         if !r.uninitialized {
-            let (lo, hi) = keys::span(&r.desc.start, &r.desc.end);
             let others_cover = self
                 .replicas
                 .values()
                 .any(|o| !o.uninitialized && o.desc.overlaps(&r.desc));
             if !others_cover {
-                for kv in self.engine.iter(Bound::Included(&lo), Bound::Excluded(&hi)) {
-                    let (k, _) = kv.map_err(storage_err)?;
+                for (k, _) in eval::range_pairs(&self.engine, &r.desc)? {
                     b.delete(k);
                 }
             }
@@ -1166,7 +1565,7 @@ impl Store {
             self.engine.write(&c, false).map_err(storage_err)?;
         }
         self.log.remove(id);
-        for (_, (t, _)) in r.reads {
+        for t in r.reads.into_values().chain(r.confirmed).map(|p| p.token) {
             self.client_out
                 .push((t, Response::Error(KvError::RangeNotFound { hint: None })));
         }

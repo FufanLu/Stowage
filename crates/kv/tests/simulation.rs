@@ -41,6 +41,7 @@ fn config(nodes: u64, split_bytes: u64, rebalance: bool) -> StoreConfig {
 }
 
 fn world(seed: u64, nodes: u64, cfg: StoreConfig, net: NetConfig, keys: u64) -> World {
+    stowage_kv::store::divergence::enable();
     let mut sim = Simulation::new(
         seed,
         SimConfig {

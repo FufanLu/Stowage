@@ -950,6 +950,7 @@ dependencies = [
  "clap",
  "hdrhistogram",
  "stowage-common",
+ "stowage-kv",
  "stowage-node",
  "stowage-storage",
  "tokio",

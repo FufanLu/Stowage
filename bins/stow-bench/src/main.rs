@@ -29,6 +29,36 @@ enum Cmd {
     Engine(EngineArgs),
     /// Concurrent key-value workload against a running cluster.
     Kv(KvArgs),
+    /// Bank transfers and audits as transactions against a running cluster;
+    /// checks that every audit sees the same total.
+    Bank(BankArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct BankArgs {
+    #[arg(
+        long,
+        default_value = "1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003"
+    )]
+    peers: String,
+    #[arg(long, default_value_t = 1000)]
+    accounts: u64,
+    /// Transactions in flight.
+    #[arg(long, default_value_t = 32)]
+    concurrency: usize,
+    #[arg(long, default_value_t = 20)]
+    duration: u64,
+    /// Fraction of transactions that are audits reading `audit_size` accounts.
+    #[arg(long, default_value_t = 0.1)]
+    audit_ratio: f64,
+    #[arg(long, default_value_t = 10)]
+    audit_size: u64,
+    /// `ssi` or `si`.
+    #[arg(long, default_value = "ssi")]
+    isolation: String,
+    /// Split the accounts into this many ranges first.
+    #[arg(long, default_value_t = 6)]
+    presplit: u64,
 }
 
 #[derive(Debug, clap::Args)]
@@ -270,6 +300,10 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()?
             .block_on(kv_bench(a)),
+        Cmd::Bank(a) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(bank_bench(a)),
     }
 }
 
@@ -412,5 +446,245 @@ async fn kv_bench(a: KvArgs) -> anyhow::Result<()> {
         *leaders.entry(r.leader.unwrap_or(0)).or_insert(0) += 1;
     }
     println!("{} ranges; leaders per node {:?}", ranges.len(), leaders);
+    Ok(())
+}
+
+const BALANCE: u64 = 1000;
+
+/// A committed transfer: (commit timestamp, from, to, amount, reads).
+type Committed = (
+    stowage_common::Timestamp,
+    u64,
+    u64,
+    u64,
+    Vec<Option<Vec<u8>>>,
+);
+
+fn acct(i: u64) -> Vec<u8> {
+    format!("acct{i:06}").into_bytes()
+}
+
+fn balance(v: &Option<Vec<u8>>) -> u64 {
+    v.as_ref()
+        .and_then(|b| b.get(..8))
+        .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])))
+}
+
+async fn bank_bench(a: BankArgs) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use stowage_kv::txn::{Isolation, Outcome, Step, TxnOp};
+    let iso = match a.isolation.as_str() {
+        "si" => Isolation::Snapshot,
+        _ => Isolation::Serializable,
+    };
+    let client = Arc::new(stowage_node::KvClient::new(
+        stowage_node::parse_peers(&a.peers).map_err(anyhow::Error::msg)?,
+    ));
+    for i in 1..a.presplit {
+        client.split(&acct(a.accounts / a.presplit * i)).await?;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Fund every account, 50 per transaction.
+    let t = Instant::now();
+    for chunk in (0..a.accounts).collect::<Vec<_>>().chunks(50) {
+        let keys: Vec<u64> = chunk.to_vec();
+        let out = client
+            .transact(
+                iso,
+                Box::new(move |_, done| match keys.get(done) {
+                    Some(&k) => Step::Op(TxnOp::Put(acct(k), BALANCE.to_le_bytes().to_vec())),
+                    None => Step::Commit,
+                }),
+            )
+            .await?;
+        anyhow::ensure!(
+            matches!(out, Outcome::Committed { .. }),
+            "funding failed: {out:?}"
+        );
+    }
+    println!(
+        "funded {} accounts in {:.1} s",
+        a.accounts,
+        t.elapsed().as_secs_f64()
+    );
+    let deadline = Instant::now() + Duration::from_secs(a.duration);
+    let mut tasks = Vec::new();
+    for w in 0..a.concurrency {
+        let client = client.clone();
+        let (accounts, audit_ratio, audit_size) = (a.accounts, a.audit_ratio, a.audit_size);
+        tasks.push(tokio::spawn(async move {
+            let mut rng = Xoshiro256::seeded(w as u64 + 7);
+            let mut h = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).expect("hist");
+            let (mut transfers, mut audits, mut restarts, mut failed, mut bad) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut history: Vec<Committed> = Vec::new();
+            while Instant::now() < deadline {
+                let t = Instant::now();
+                let audit = rng.gen_bool(audit_ratio);
+                let mut xfer = (0, 0, 0);
+                let program: stowage_kv::txn::Program = if audit {
+                    // A read-only snapshot of `audit_size` consecutive accounts.
+                    let start = rng.gen_range(0, accounts.saturating_sub(audit_size).max(1));
+                    Box::new(move |_, done| {
+                        if (done as u64) < audit_size {
+                            Step::Op(TxnOp::Get(acct(start + done as u64)))
+                        } else {
+                            Step::Commit
+                        }
+                    })
+                } else {
+                    let from = rng.gen_range(0, accounts);
+                    let to = (from + rng.gen_range(1, accounts)) % accounts;
+                    let amt = rng.gen_range(1, 100);
+                    xfer = (from, to, amt);
+                    Box::new(move |reads, done| match done {
+                        0 => Step::Op(TxnOp::Get(acct(from))),
+                        1 => Step::Op(TxnOp::Get(acct(to))),
+                        2 if balance(&reads[0]) < amt => Step::Commit,
+                        2 => Step::Op(TxnOp::Put(
+                            acct(from),
+                            (balance(&reads[0]) - amt).to_le_bytes().to_vec(),
+                        )),
+                        3 => Step::Op(TxnOp::Put(
+                            acct(to),
+                            (balance(&reads[1]) + amt).to_le_bytes().to_vec(),
+                        )),
+                        _ => Step::Commit,
+                    })
+                };
+                match client.transact(iso, program).await {
+                    Ok(Outcome::Committed {
+                        restarts: r,
+                        reads,
+                        commit_ts,
+                    }) => {
+                        if !audit {
+                            history.push((commit_ts, xfer.0, xfer.1, xfer.2, reads.clone()));
+                        }
+                        let _ = h.record(t.elapsed().as_nanos() as u64);
+                        restarts += u64::from(r);
+                        if audit {
+                            audits += 1;
+                            if reads.iter().any(Option::is_none) {
+                                bad += 1;
+                            }
+                        } else {
+                            transfers += 1;
+                        }
+                    }
+                    _ => failed += 1,
+                }
+            }
+            (h, transfers, audits, restarts, failed, bad, history)
+        }));
+    }
+    let mut lat = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)?;
+    let (mut transfers, mut audits, mut restarts, mut failed, mut bad) = (0, 0, 0, 0, 0);
+    let mut history = Vec::new();
+    for t in tasks {
+        let (h, tr, au, re, fa, ba, hi) = t.await?;
+        history.extend(hi);
+        lat.add(h)?;
+        transfers += tr;
+        audits += au;
+        restarts += re;
+        failed += fa;
+        bad += ba;
+    }
+    // The invariant: one snapshot read of every account sums to the start total.
+    let n = a.accounts;
+    let out = client
+        .transact(
+            iso,
+            Box::new(move |_, done| {
+                if (done as u64) < n {
+                    Step::Op(TxnOp::Get(acct(done as u64)))
+                } else {
+                    Step::Commit
+                }
+            }),
+        )
+        .await?;
+    let Outcome::Committed { reads, .. } = out else {
+        anyhow::bail!("final audit did not commit: {out:?}");
+    };
+    let total: u64 = reads.iter().map(balance).sum();
+    // Replay the committed transfers in commit-timestamp order: under SSI each one
+    // must have read exactly the state its predecessors left.
+    history.sort_by_key(|h| h.0);
+    let mut state = vec![BALANCE; usize::try_from(n).unwrap_or(0)];
+    let mut last: Vec<Option<String>> = vec![None; state.len()];
+    let mut anomalies = 0;
+    for (ts, from, to, amt, r) in &history {
+        let (f, t) = (
+            usize::try_from(*from).unwrap_or(0),
+            usize::try_from(*to).unwrap_or(0),
+        );
+        let (rf, rt) = (balance(&r[0]), balance(&r[1]));
+        if (rf, rt) != (state[f], state[t]) {
+            anomalies += 1;
+            if anomalies <= 5 {
+                println!(
+                    "anomaly: transfer {from}->{to} of {amt} committed at {ts} read ({rf}, {rt}), replay has ({}, {})",
+                    state[f], state[t]
+                );
+                println!(
+                    "    last writer of {from}: {:?}\n    last writer of {to}: {:?}",
+                    last[f], last[t]
+                );
+            }
+        }
+        if rf >= *amt {
+            last[f] = Some(format!("{from}->{to} {amt} at {ts} read ({rf}, {rt})"));
+            last[t] = last[f].clone();
+        }
+        if rf >= *amt {
+            state[f] = rf - amt;
+            state[t] = rt + amt;
+        }
+    }
+    println!(
+        "replayed {} committed transfers: {anomalies} read a state their predecessors did not leave",
+        history.len()
+    );
+    for (i, r) in reads.iter().enumerate() {
+        if balance(r) != state[i] {
+            println!(
+                "account {i}: store has {}, replay has {}",
+                balance(r),
+                state[i]
+            );
+            for (ts, from, to, amt, rr) in &history {
+                if *from == i as u64 || *to == i as u64 {
+                    println!(
+                        "    {ts} {from}->{to} {amt} read ({}, {})",
+                        balance(&rr[0]),
+                        balance(&rr[1])
+                    );
+                }
+            }
+        }
+    }
+    let secs = a.duration as f64;
+    let q = |p: f64| lat.value_at_quantile(p) as f64 / 1e6;
+    println!(
+        "\n{} · {} accounts · {} ranges · concurrency {} · {} s",
+        a.isolation, a.accounts, a.presplit, a.concurrency, a.duration
+    );
+    println!("| txn/s | transfers | audits | restarts | failed | p50 ms | p99 ms | p99.9 ms |");
+    println!("|------:|----------:|-------:|---------:|-------:|-------:|-------:|---------:|");
+    println!(
+        "| {:>5.0} | {transfers:>9} | {audits:>6} | {restarts:>8} | {failed:>6} | {:>6.2} | {:>6.2} | {:>8.2} |",
+        (transfers + audits) as f64 / secs,
+        q(0.5),
+        q(0.99),
+        q(0.999)
+    );
+    println!(
+        "final audit: total {total} (expected {}), missing accounts in audits: {bad}",
+        n * BALANCE
+    );
+    anyhow::ensure!(total == n * BALANCE, "money was created or destroyed");
     Ok(())
 }

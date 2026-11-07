@@ -306,6 +306,17 @@ impl<S: Storage> Raft<S> {
     pub fn applied(&self) -> Index {
         self.applied
     }
+
+    /// Tell a freshly opened node how far its state machine already got (it
+    /// persists its own applied index). Entries up to there were committed, or
+    /// they would not have been applied, so the commit index moves too. Without
+    /// this, `applied` restarts at the snapshot index, and a snapshot sent before
+    /// it catches up would be labelled older than the state it carries.
+    pub fn restore_applied(&mut self, index: Index) {
+        let index = index.min(self.store.last_index());
+        self.applied = self.applied.max(index);
+        self.commit = self.commit.max(index);
+    }
     pub fn last_index(&self) -> Index {
         self.store.last_index()
     }

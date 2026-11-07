@@ -12,6 +12,12 @@ use stowage_sim::linearizability::{Op, RegisterOp};
 use stowage_sim::{Actor, CLIENT, Ctx, MS, NodeEnv, Simulation};
 
 pub const TICK: u64 = 10 * MS;
+/// Inputs arriving within this window are handled before one flush, the way the
+/// real server drains its queue before proposing: a request can then find
+/// writes queued but not yet proposed (chapter 05, bug 9).
+pub const BATCH_WINDOW: u64 = MS / 2;
+const TICK_TIMER: u64 = 0;
+const FLUSH_TIMER: u64 = 1;
 
 #[derive(Clone)]
 pub enum Msg {
@@ -23,7 +29,7 @@ pub enum Msg {
 impl std::fmt::Debug for Msg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Msg::Peer(PeerMsg::Raft { range, msg }) => write!(
+            Msg::Peer(PeerMsg::Raft { range, msg, .. }) => write!(
                 f,
                 "{} t{} {}",
                 short_range(*range),
@@ -60,12 +66,18 @@ fn short_body(b: &stowage_raft::Body) -> String {
             }
             EntryKind::Config(m) => format!("config {:?}", m.voters),
             EntryKind::Normal(d) => match Command::decode(d) {
-                Ok(Command::Write { ops, .. }) => format!(
-                    "write {:?}",
-                    ops.iter()
-                        .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
-                        .collect::<Vec<_>>()
+                Ok(Command::Put { key, txn, .. }) => format!(
+                    "{} {:?}",
+                    if txn.is_some() { "intent" } else { "write" },
+                    String::from_utf8_lossy(&key)
                 ),
+                Ok(Command::EndTxn { commit, .. }) => format!("end-txn commit={commit}"),
+                Ok(Command::Resolve { key, commit, .. }) => format!(
+                    "resolve {:?} commit={commit}",
+                    String::from_utf8_lossy(&key)
+                ),
+                Ok(Command::Push { kind, .. }) => format!("push {kind:?}"),
+                Ok(Command::Heartbeat { .. }) => "heartbeat".to_string(),
                 Ok(Command::Split { key, new_id, .. }) => format!(
                     "split at {:?} → {}",
                     String::from_utf8_lossy(&key),
@@ -112,6 +124,7 @@ fn short_body(b: &stowage_raft::Body) -> String {
 
 pub struct Node {
     pub store: Store,
+    flush_armed: bool,
 }
 
 impl std::fmt::Debug for Node {
@@ -125,7 +138,8 @@ impl Node {
         let mut cfg = cfg.clone();
         cfg.node = env.id;
         Self {
-            store: Store::open(cfg, env.disk()).unwrap(),
+            store: Store::open(cfg, env.disk(), env.clock()).unwrap(),
+            flush_armed: false,
         }
     }
 
@@ -144,7 +158,7 @@ impl Actor for Node {
     type Msg = Msg;
 
     fn on_start(&mut self, ctx: &mut Ctx<'_, Msg>) {
-        ctx.set_timer(TICK, 0);
+        ctx.set_timer(TICK, TICK_TIMER);
         self.drain(ctx);
     }
 
@@ -154,12 +168,19 @@ impl Actor for Node {
             Msg::Client { token, req } => self.store.handle_client(token, req).unwrap(),
             Msg::Reply { .. } => {}
         }
-        self.drain(ctx);
+        if !self.flush_armed {
+            self.flush_armed = true;
+            ctx.set_timer(BATCH_WINDOW, FLUSH_TIMER);
+        }
     }
 
-    fn on_timer(&mut self, ctx: &mut Ctx<'_, Msg>, _t: u64) {
-        self.store.tick().unwrap();
-        ctx.set_timer(TICK, 0);
+    fn on_timer(&mut self, ctx: &mut Ctx<'_, Msg>, t: u64) {
+        if t == FLUSH_TIMER {
+            self.flush_armed = false;
+        } else {
+            self.store.tick().unwrap();
+            ctx.set_timer(TICK, TICK_TIMER);
+        }
         self.drain(ctx);
     }
 }

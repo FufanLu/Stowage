@@ -55,7 +55,12 @@ type ConnWriters = Arc<std::sync::Mutex<HashMap<u64, mpsc::UnboundedSender<Vec<u
 /// Start the node and run until the process exits.
 pub async fn run(cfg: NodeConfig) -> std::io::Result<()> {
     let disk = Arc::new(OsDisk::open(&cfg.data_dir)?);
-    let store = Store::open(cfg.store.clone(), disk).map_err(std::io::Error::other)?;
+    let store = Store::open(
+        cfg.store.clone(),
+        disk,
+        Arc::new(stowage_common::os::SystemClock),
+    )
+    .map_err(std::io::Error::other)?;
     let (in_tx, in_rx) = std_mpsc::channel::<Input>();
     let clients: ConnWriters = Arc::default();
 
