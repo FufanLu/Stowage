@@ -65,6 +65,35 @@ jobs:
           kubectl get pods -o wide
           kubectl logs -l app.kubernetes.io/name=stowage --tail 80 --prefix
 
+  compat:
+    # Conveyor's and Milkrun's real Flyway migrations, applied by Flyway 13
+    # over pgjdbc to a three-node cluster, then their constraints exercised.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: sudo apt-get install -y --no-install-recommends postgresql-client
+      - run: cargo build --release --locked -p stowd
+      - name: start a three-node cluster
+        run: |
+          P=1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
+          for i in 1 2 3; do
+            ./target/release/stowd --node-id $i --listen 127.0.0.1:700$i --peers $P \
+              --data-dir /tmp/stowage/n$i --pg-listen 127.0.0.1:548$i \
+              --ddb-listen 127.0.0.1:848$i --http-listen 127.0.0.1:948$i > /tmp/n$i.log 2>&1 &
+          done
+          for _ in $(seq 1 30); do curl -fsS 127.0.0.1:9481/health && break; sleep 1; done
+      - name: flyway
+        run: tests/compat/flyway/run.sh 5481
+      - name: node logs on failure
+        if: failure()
+        run: tail -n 60 /tmp/n*.log
+
   test:
     name: test / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

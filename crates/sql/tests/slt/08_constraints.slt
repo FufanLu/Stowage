@@ -1,0 +1,223 @@
+# CHECK, FOREIGN KEY (RESTRICT, CASCADE, SET NULL), DEFAULT now(), and the
+# shapes Conveyor's and Milkrun's migrations use.
+
+statement ok
+CREATE TABLE fc (fc_id TEXT PRIMARY KEY, region TEXT NOT NULL)
+
+statement ok
+INSERT INTO fc VALUES ('east-1', 'us-east'), ('west-1', 'us-west')
+
+statement ok
+CREATE TABLE stock (
+    sku     VARCHAR(10) NOT NULL CHECK (sku ~ '^B0[0-9A-F]{8}$'),
+    fc_id   TEXT        NOT NULL REFERENCES fc,
+    on_hand INT         NOT NULL CHECK (on_hand >= 0),
+    PRIMARY KEY (sku, fc_id)
+)
+
+statement ok
+INSERT INTO stock VALUES ('B000000001', 'east-1', 5)
+
+statement error violates check constraint "stock_sku_check"
+INSERT INTO stock VALUES ('b-lowercase', 'east-1', 5)
+
+statement error violates check constraint "stock_on_hand_check"
+INSERT INTO stock VALUES ('B000000002', 'east-1', -1)
+
+statement error violates check constraint "stock_on_hand_check"
+UPDATE stock SET on_hand = on_hand - 10
+
+statement error violates foreign key constraint "stock_fc_id_fkey": key is not present in table "fc"
+INSERT INTO stock VALUES ('B000000003', 'mars-1', 1)
+
+# RESTRICT (the default): a referenced parent cannot go.
+statement error violates foreign key constraint "stock_fc_id_fkey" on table "stock"
+DELETE FROM fc WHERE fc_id = 'east-1'
+
+# An unreferenced one can.
+statement ok
+DELETE FROM fc WHERE fc_id = 'west-1'
+
+# Nor can its key change while referenced.
+statement error violates foreign key constraint "stock_fc_id_fkey"
+UPDATE fc SET fc_id = 'east-9' WHERE fc_id = 'east-1'
+
+# Changing a non-key column of the parent is fine.
+statement ok
+UPDATE fc SET region = 'us-east-2' WHERE fc_id = 'east-1'
+
+# A NULL in the referencing column is not checked (MATCH SIMPLE).
+statement ok
+CREATE TABLE notes (id INT PRIMARY KEY, fc_id TEXT REFERENCES fc (fc_id) ON DELETE SET NULL, body TEXT)
+
+statement ok
+INSERT INTO notes VALUES (1, 'east-1', 'dock 4'), (2, NULL, 'no fc')
+
+# CASCADE, through a table-level constraint and a composite primary key.
+statement ok
+CREATE TABLE reservation (
+    reservation_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('HELD', 'COMMITTED', 'RELEASED')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+
+statement ok
+CREATE TABLE reservation_line (
+    reservation_id TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    PRIMARY KEY (reservation_id, sku),
+    FOREIGN KEY (reservation_id) REFERENCES reservation ON DELETE CASCADE
+)
+
+statement ok
+INSERT INTO reservation (reservation_id, idempotency_key, status) VALUES ('r1', 'k1', 'HELD'), ('r2', 'k2', 'HELD')
+
+statement error violates check constraint "reservation_status_check"
+INSERT INTO reservation (reservation_id, idempotency_key, status) VALUES ('r3', 'k3', 'LOST')
+
+# DEFAULT now() is the inserting statement's time, not CREATE TABLE's.
+query B
+SELECT count(*) = 2 FROM reservation WHERE created_at > '2020-01-01'
+----
+t
+
+statement ok
+INSERT INTO reservation_line VALUES ('r1', 'B000000001', 2), ('r1', 'B000000002', 1), ('r2', 'B000000001', 4)
+
+statement ok
+DELETE FROM reservation WHERE reservation_id = 'r1'
+
+query TI
+SELECT reservation_id, quantity FROM reservation_line
+----
+r2 4
+
+# A NULL CHECK result passes, as in SQL.
+statement ok
+CREATE TABLE maybe (id INT PRIMARY KEY, n INT CHECK (n > 0))
+
+statement ok
+INSERT INTO maybe VALUES (1, NULL)
+
+# The referenced columns must be a primary key or unique.
+statement error there is no unique constraint matching given keys for referenced table "fc"
+CREATE TABLE bad (id INT PRIMARY KEY, region TEXT REFERENCES fc (region))
+
+# ---- ALTER TABLE
+
+statement ok
+CREATE TABLE history (installed_rank INT NOT NULL, version TEXT, success BOOLEAN NOT NULL)
+
+statement ok
+ALTER TABLE history ADD CONSTRAINT history_pk PRIMARY KEY (installed_rank)
+
+statement ok
+INSERT INTO history VALUES (1, '1', true)
+
+statement error duplicate key value violates unique constraint
+INSERT INTO history VALUES (1, '2', true)
+
+statement ok
+ALTER TABLE history ADD COLUMN checksum INT
+
+statement ok
+ALTER TABLE history ADD COLUMN installed_by TEXT NOT NULL DEFAULT 'flyway'
+
+query ITBIT
+SELECT * FROM history
+----
+1 1 t NULL flyway
+
+statement error violates check constraint "history_rank_positive"
+ALTER TABLE history ADD CONSTRAINT history_rank_positive CHECK (installed_rank > 1)
+
+statement ok
+ALTER TABLE history ADD CONSTRAINT history_rank_positive CHECK (installed_rank > 0)
+
+statement error violates check constraint "history_rank_positive"
+INSERT INTO history (installed_rank, success) VALUES (0, false)
+
+statement ok
+ALTER TABLE history DROP CONSTRAINT history_rank_positive
+
+statement ok
+INSERT INTO history (installed_rank, success) VALUES (0, false)
+
+statement ok
+ALTER TABLE history RENAME COLUMN version TO script
+
+statement ok
+ALTER TABLE history DROP COLUMN checksum
+
+query IT rowsort
+SELECT installed_rank, script FROM history
+----
+0 NULL
+1 1
+
+statement error null value in column "script"
+ALTER TABLE history ALTER COLUMN script SET NOT NULL
+
+statement ok
+ALTER TABLE history ADD CONSTRAINT history_by_unique UNIQUE (installed_by, installed_rank)
+
+statement error not supported: ADD PRIMARY KEY on a table that has rows
+CREATE TABLE late (a INT); INSERT INTO late VALUES (1); ALTER TABLE late ADD PRIMARY KEY (a)
+
+# ---- UNION, regular expressions, pg_catalog
+
+query T rowsort
+SELECT fc_id FROM fc UNION ALL SELECT fc_id FROM notes WHERE fc_id IS NOT NULL
+----
+east-1
+east-1
+
+query T
+SELECT fc_id FROM fc UNION SELECT fc_id FROM notes WHERE fc_id IS NOT NULL
+----
+east-1
+
+query IT
+SELECT 1, 'a' UNION ALL SELECT 2, 'b' UNION ALL SELECT 3, 'c' ORDER BY 1 DESC
+----
+3 c
+2 b
+1 a
+
+query BBBB
+SELECT 'B0ABCDEF12' ~ '^B0[0-9A-F]{8}$', 'b0abcdef12' ~* '^B0[0-9A-F]{8}$', 'x' !~ 'y', 'X' !~* 'x'
+----
+t t t f
+
+query I
+SELECT count(*) FROM pg_catalog.pg_namespace n WHERE n.nspname = 'public'
+----
+1
+
+query T rowsort
+SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname LIKE 'reservation%'
+----
+reservation
+reservation_line
+
+query T
+SELECT current_schema
+----
+public
+
+# ---- DROP TABLE with dependents
+
+statement error cannot drop table reservation because constraint reservation_line_reservation_id_fkey on table reservation_line depends on it
+DROP TABLE reservation
+
+statement ok
+DROP TABLE reservation CASCADE
+
+# The child keeps its rows and loses only the constraint.
+statement ok
+INSERT INTO reservation_line VALUES ('gone', 'B000000009', 1)
+
+statement ok
+DROP TABLE fc, stock, notes

@@ -28,6 +28,35 @@ pub struct Column {
     /// The implicit `rowid` key of a table declared without a primary key; not
     /// shown by `SELECT *`.
     pub hidden: bool,
+    /// `DEFAULT now()` / `CURRENT_TIMESTAMP`: the inserting statement's time.
+    pub default_now: bool,
+}
+
+/// `CHECK (expr)`: the expression's SQL text, bound against the row when it is
+/// written. A row fails only if the expression is false (NULL passes, as in SQL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub name: String,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    /// `NO ACTION` / `RESTRICT`: refuse to remove a referenced row.
+    Restrict,
+    Cascade,
+    SetNull,
+}
+
+/// `FOREIGN KEY (cols) REFERENCES parent (parent_cols)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub cols: Vec<usize>,
+    pub parent: String,
+    /// Positions in the parent's columns: its primary key or a unique index.
+    pub parent_cols: Vec<usize>,
+    pub on_delete: FkAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +92,8 @@ pub struct Table {
     pub indexes: Vec<Index>,
     pub next_index_id: u32,
     pub stats: Option<Stats>,
+    pub checks: Vec<Check>,
+    pub fks: Vec<ForeignKey>,
 }
 
 impl Table {
@@ -102,7 +133,7 @@ impl Table {
 
     fn encode(&self) -> Vec<u8> {
         let mut w = W::new();
-        w.u8(2)
+        w.u8(3)
             .u32(self.id)
             .bytes(self.name.as_bytes())
             .u32(self.columns.len() as u32);
@@ -149,6 +180,28 @@ impl Table {
                 }
             }
         }
+        // Version 3.
+        for c in &self.columns {
+            w.u8(u8::from(c.default_now));
+        }
+        w.u32(self.checks.len() as u32);
+        for c in &self.checks {
+            w.bytes(c.name.as_bytes()).bytes(c.sql.as_bytes());
+        }
+        w.u32(self.fks.len() as u32);
+        for f in &self.fks {
+            w.bytes(f.name.as_bytes())
+                .bytes(f.parent.as_bytes())
+                .u8(match f.on_delete {
+                    FkAction::Restrict => 0,
+                    FkAction::Cascade => 1,
+                    FkAction::SetNull => 2,
+                })
+                .u32(f.cols.len() as u32);
+            for (&c, &p) in f.cols.iter().zip(&f.parent_cols) {
+                w.u32(c as u32).u32(p as u32);
+            }
+        }
         w.finish()
     }
 
@@ -180,6 +233,7 @@ impl Table {
                 default,
                 serial,
                 hidden,
+                default_now: false,
             });
         }
         let pk = (0..r.u32().map_err(e)?)
@@ -227,6 +281,40 @@ impl Table {
         } else {
             None
         };
+        let mut checks = Vec::new();
+        let mut fks = Vec::new();
+        if version >= 3 {
+            for c in &mut columns {
+                c.default_now = r.u8().map_err(e)? == 1;
+            }
+            for _ in 0..r.u32().map_err(e)? {
+                checks.push(Check {
+                    name: s(r.bytes().map_err(e)?)?,
+                    sql: s(r.bytes().map_err(e)?)?,
+                });
+            }
+            for _ in 0..r.u32().map_err(e)? {
+                let name = s(r.bytes().map_err(e)?)?;
+                let parent = s(r.bytes().map_err(e)?)?;
+                let on_delete = match r.u8().map_err(e)? {
+                    1 => FkAction::Cascade,
+                    2 => FkAction::SetNull,
+                    _ => FkAction::Restrict,
+                };
+                let (mut cols, mut parent_cols) = (Vec::new(), Vec::new());
+                for _ in 0..r.u32().map_err(e)? {
+                    cols.push(r.u32().map_err(e)? as usize);
+                    parent_cols.push(r.u32().map_err(e)? as usize);
+                }
+                fks.push(ForeignKey {
+                    name,
+                    cols,
+                    parent,
+                    parent_cols,
+                    on_delete,
+                });
+            }
+        }
         Ok(Self {
             id,
             name,
@@ -235,6 +323,8 @@ impl Table {
             indexes,
             next_index_id,
             stats,
+            checks,
+            fks,
         })
     }
 }
@@ -312,6 +402,7 @@ mod tests {
                     default: None,
                     serial: true,
                     hidden: false,
+                    default_now: false,
                 },
                 Column {
                     name: "note".into(),
@@ -320,6 +411,7 @@ mod tests {
                     default: Some(Value::Text("-".into())),
                     serial: false,
                     hidden: false,
+                    default_now: true,
                 },
             ],
             pk: vec![0],
@@ -337,6 +429,17 @@ mod tests {
                 nulls: vec![0, 1],
                 bounds: vec![vec![Value::Int(1), Value::Int(10)], vec![]],
             }),
+            checks: vec![Check {
+                name: "orders_id_check".into(),
+                sql: "id > 0".into(),
+            }],
+            fks: vec![ForeignKey {
+                name: "orders_note_fkey".into(),
+                cols: vec![1],
+                parent: "notes".into(),
+                parent_cols: vec![0],
+                on_delete: FkAction::Cascade,
+            }],
         };
         assert_eq!(Table::decode(&t.encode()).unwrap(), t);
     }

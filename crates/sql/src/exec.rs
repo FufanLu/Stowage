@@ -264,6 +264,36 @@ fn exec<'a, 't: 'a>(
                 let len = limit.map_or(n - from, |l| (l as usize).min(n - from));
                 b.slice(from, len)
             }
+            Plan::Union { inputs, schema } => {
+                let mut parts = Vec::with_capacity(inputs.len());
+                for (i, input) in inputs.iter().enumerate() {
+                    parts.push(exec(input, ctx, child(i)).await?);
+                }
+                let n = parts.iter().map(RecordBatch::num_rows).sum();
+                let mut cols = Vec::with_capacity(schema.len());
+                for (c, f) in schema.iter().enumerate() {
+                    let target = f.ty.arrow();
+                    let arrays = parts
+                        .iter()
+                        .map(|b| {
+                            let a = b.column(c);
+                            if a.data_type() == &target {
+                                Ok(a.clone())
+                            } else {
+                                Ok(compute::cast(a, &target)?)
+                            }
+                        })
+                        .collect::<Result<Vec<ArrayRef>>>()?;
+                    let refs: Vec<&dyn arrow::array::Array> =
+                        arrays.iter().map(AsRef::as_ref).collect();
+                    cols.push(if refs.is_empty() {
+                        build_array(f.ty, std::iter::empty())?
+                    } else {
+                        compute::concat(&refs)?
+                    });
+                }
+                batch(schema, cols, n)?
+            }
             Plan::Distinct { input } => {
                 let b = exec(input, ctx, child(0)).await?;
                 if b.num_columns() == 0 || b.num_rows() == 0 {
@@ -511,6 +541,31 @@ pub fn eval(e: &Expr, b: &RecordBatch, fields: &[Field], now: i64) -> Result<Arr
             pattern,
             negated,
             insensitive,
+            regex: true,
+        } => {
+            let (a, p) = (eval(expr, b, fields, now)?, eval(pattern, b, fields, now)?);
+            let a = compute::cast(&a, &arrow::datatypes::DataType::Utf8)?;
+            let p = compute::cast(&p, &arrow::datatypes::DataType::Utf8)?;
+            use arrow::array::AsArray as _;
+            let (a, p) = (a.as_string::<i32>(), p.as_string::<i32>());
+            let flags = insensitive.then_some("i");
+            // A constant pattern (the usual case) compiles once.
+            let r =
+                if p.len() > 0 && (0..p.len()).all(|i| p.is_valid(i) && p.value(i) == p.value(0)) {
+                    compute::regexp_is_match_scalar(a, p.value(0), flags)
+                } else {
+                    let f = flags.map(|f| arrow::array::StringArray::from(vec![f; a.len()]));
+                    compute::regexp_is_match(a, p, f.as_ref())
+                }
+                .map_err(|e| Error::InvalidInput(format!("invalid regular expression: {e}")))?;
+            Arc::new(if *negated { compute::not(&r)? } else { r })
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            insensitive,
+            regex: false,
         } => {
             let (a, p) = (eval(expr, b, fields, now)?, eval(pattern, b, fields, now)?);
             use arrow::compute::kernels::comparison as like;

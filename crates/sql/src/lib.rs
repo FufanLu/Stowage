@@ -14,12 +14,14 @@ pub mod audit;
 pub mod auth;
 pub mod binder;
 pub mod catalog;
+pub mod constraints;
 pub mod dml;
 pub mod exec;
 pub mod explain;
 pub mod keycodec;
 pub mod kv;
 pub mod optimizer;
+pub mod pgcatalog;
 pub mod plan;
 pub mod session;
 pub mod stats;
@@ -57,6 +59,12 @@ pub enum Error {
     DuplicateObject(String),
     #[error("duplicate key value violates unique constraint \"{0}\"")]
     UniqueViolation(String),
+    #[error("new row for relation \"{0}\" violates check constraint \"{1}\"")]
+    CheckViolation(String, String),
+    #[error("{0}")]
+    ForeignKeyViolation(String),
+    #[error("{0}")]
+    DependentObjects(String),
     #[error("null value in column \"{0}\" of relation \"{1}\" violates not-null constraint")]
     NotNullViolation(String, String),
     #[error("division by zero")]
@@ -92,6 +100,9 @@ impl Error {
             Self::DuplicateObject(_) => "42710",
             Self::UniqueViolation(_) => "23505",
             Self::NotNullViolation(..) => "23502",
+            Self::CheckViolation(..) => "23514",
+            Self::ForeignKeyViolation(_) => "23503",
+            Self::DependentObjects(_) => "2BP01",
             Self::DivisionByZero => "22012",
             Self::OutOfRange(_) => "22003",
             Self::Retry(_) => "40001",

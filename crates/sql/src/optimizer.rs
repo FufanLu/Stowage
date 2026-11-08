@@ -50,6 +50,7 @@ pub fn rows(p: &Plan) -> f64 {
         }
         Plan::Project { input, .. } | Plan::Sort { input, .. } => rows(input),
         Plan::Distinct { input } => (rows(input) * 0.5).max(1.0),
+        Plan::Union { inputs, .. } => inputs.iter().map(rows).sum::<f64>().max(1.0),
         Plan::Limit {
             input,
             limit,
@@ -394,6 +395,16 @@ fn pushdown(p: Plan, mut preds: Vec<Expr>) -> Plan {
             input: Box::new(pushdown(*input, preds)),
         },
         p @ Plan::Values { .. } => wrap(p, preds),
+        Plan::Union { inputs, schema } => wrap(
+            Plan::Union {
+                inputs: inputs
+                    .into_iter()
+                    .map(|i| pushdown(i, Vec::new()))
+                    .collect(),
+                schema,
+            },
+            preds,
+        ),
     }
 }
 
@@ -519,6 +530,10 @@ fn reorder(p: Plan) -> Plan {
         },
         Plan::Distinct { input } => Plan::Distinct {
             input: Box::new(reorder(*input)),
+        },
+        Plan::Union { inputs, schema } => Plan::Union {
+            inputs: inputs.into_iter().map(reorder).collect(),
+            schema,
         },
         p => p,
     }
@@ -724,6 +739,10 @@ fn access_paths(p: Plan) -> Plan {
         },
         Plan::Distinct { input } => Plan::Distinct {
             input: Box::new(access_paths(*input)),
+        },
+        Plan::Union { inputs, schema } => Plan::Union {
+            inputs: inputs.into_iter().map(access_paths).collect(),
+            schema,
         },
         p => p,
     }

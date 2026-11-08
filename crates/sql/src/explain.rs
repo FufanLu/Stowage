@@ -189,6 +189,7 @@ fn walk(
             }
         ),
         Plan::Distinct { .. } => "Distinct".to_owned(),
+        Plan::Union { inputs, .. } => format!("Append {} inputs", inputs.len()),
     };
     line.push_str(&format!("  (rows≈{:.0}", optimizer::rows(p)));
     if let Some(s) = stats.and_then(|s| s.get(id)) {

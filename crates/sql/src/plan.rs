@@ -107,11 +107,13 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `LIKE`/`ILIKE`, or with `regex` the POSIX operators `~`, `~*`, `!~`, `!~*`.
     Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
         insensitive: bool,
+        regex: bool,
     },
     Cast(Box<Expr>, DataType),
     Case {
@@ -262,11 +264,13 @@ impl Expr {
                 pattern,
                 negated,
                 insensitive,
+                regex,
             } => Self::Like {
                 expr: Box::new(expr.transform(f)),
                 pattern: Box::new(pattern.transform(f)),
                 negated,
                 insensitive,
+                regex,
             },
             Self::Case {
                 operand,
@@ -408,6 +412,12 @@ pub enum Plan {
     Distinct {
         input: Box<Plan>,
     },
+    /// `UNION ALL`: the inputs' rows one after another, matched by position.
+    /// Each input already has `schema`'s types; `UNION` is `Distinct` over this.
+    Union {
+        inputs: Vec<Plan>,
+        schema: Vec<Field>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -437,7 +447,8 @@ impl Plan {
                 .collect(),
             Self::Values { schema, .. }
             | Self::Project { schema, .. }
-            | Self::Aggregate { schema, .. } => schema.clone(),
+            | Self::Aggregate { schema, .. }
+            | Self::Union { schema, .. } => schema.clone(),
             Self::Filter { input, .. }
             | Self::Sort { input, .. }
             | Self::Limit { input, .. }
@@ -467,6 +478,7 @@ impl Plan {
             | Self::Limit { input, .. }
             | Self::Distinct { input } => vec![input],
             Self::Join { left, right, .. } => vec![left, right],
+            Self::Union { inputs, .. } => inputs.iter().collect(),
         }
     }
 }
@@ -509,6 +521,22 @@ impl fmt::Display for Display<'_> {
                 pattern,
                 negated,
                 insensitive,
+                regex: true,
+            } => {
+                let op = match (negated, insensitive) {
+                    (false, false) => "~",
+                    (false, true) => "~*",
+                    (true, false) => "!~",
+                    (true, true) => "!~*",
+                };
+                write!(f, "{} {op} {}", d(expr), d(pattern))
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+                insensitive,
+                regex: false,
             } => {
                 write!(
                     f,

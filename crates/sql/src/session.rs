@@ -296,6 +296,7 @@ impl Session {
         let admin = matches!(
             stmt,
             Statement::CreateTable(_)
+                | Statement::AlterTable(_)
                 | Statement::CreateIndex(_)
                 | Statement::Drop { .. }
                 | Statement::Analyze(_)
@@ -647,6 +648,10 @@ impl Session {
                 dml::create_table(&mut b, ct).await?;
                 Ok(Output::Command("CREATE TABLE".into()))
             }
+            Statement::AlterTable(at) => {
+                dml::alter_table(&mut b, at).await?;
+                Ok(Output::Command("ALTER TABLE".into()))
+            }
             Statement::CreateIndex(ci) => {
                 // Inside a transaction block: every phase in this transaction.
                 if let Some((table, ix)) = dml::create_index_start(&mut b, ci).await? {
@@ -667,9 +672,10 @@ impl Session {
                 object_type,
                 if_exists,
                 names,
+                cascade,
                 ..
             } => {
-                dml::drop(&mut b, object_type, names, *if_exists).await?;
+                dml::drop(&mut b, object_type, names, *if_exists, *cascade).await?;
                 Ok(Output::Command(format!("DROP {object_type}")))
             }
             Statement::Analyze(a) => {

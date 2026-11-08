@@ -234,6 +234,10 @@ impl<'t> Binder<'t> {
                     let p = self.bind_query(inner).await?;
                     self.order_output(p, &order).await?
                 }
+                ast::SetExpr::SetOperation { .. } => {
+                    let p = self.bind_set_op(q.body.as_ref()).await?;
+                    self.order_output(p, &order).await?
+                }
                 other => return unsupported(format!("query {other}")),
             };
             Ok(if limit.is_some() || offset > 0 {
@@ -245,6 +249,103 @@ impl<'t> Binder<'t> {
             } else {
                 plan
             })
+        })
+    }
+
+    /// `a UNION [ALL] b UNION …`: branches bound separately, matched by position,
+    /// typed by the first branch that is not all NULLs.
+    fn bind_set_op<'a>(
+        &'a mut self,
+        body: &'a ast::SetExpr,
+    ) -> crate::kv::BoxFut<'a, Result<Plan>> {
+        Box::pin(async move {
+            match body {
+                ast::SetExpr::SetOperation {
+                    op,
+                    set_quantifier,
+                    left,
+                    right,
+                } => {
+                    if *op != ast::SetOperator::Union {
+                        return unsupported(format!("{op}"));
+                    }
+                    let all = matches!(set_quantifier, ast::SetQuantifier::All);
+                    let l = self.bind_set_op(left).await?;
+                    let r = self.bind_set_op(right).await?;
+                    let (ls, rs) = (l.schema(), r.schema());
+                    let ls: Vec<Field> = ls.into_iter().filter(|f| !f.hidden).collect();
+                    let rs: Vec<Field> = rs.into_iter().filter(|f| !f.hidden).collect();
+                    if ls.len() != rs.len() {
+                        return Err(Error::InvalidInput(format!(
+                            "each UNION query must have the same number of columns ({} and {})",
+                            ls.len(),
+                            rs.len()
+                        )));
+                    }
+                    let schema: Vec<Field> = ls
+                        .iter()
+                        .zip(&rs)
+                        .map(|(a, b)| Field {
+                            id: self.col_id(),
+                            name: a.name.clone(),
+                            qualifier: None,
+                            ty: a.ty,
+                            nullable: a.nullable || b.nullable,
+                            hidden: false,
+                        })
+                        .collect();
+                    let conform =
+                        |p: Plan, fields: Vec<Field>, schema: &[Field], ids: Vec<ColId>| {
+                            let exprs = fields
+                                .iter()
+                                .zip(schema)
+                                .map(|(f, s)| {
+                                    if f.ty == s.ty {
+                                        Expr::Column(f.id)
+                                    } else {
+                                        Expr::Cast(Box::new(Expr::Column(f.id)), s.ty)
+                                    }
+                                })
+                                .collect();
+                            let out = schema
+                                .iter()
+                                .zip(ids)
+                                .map(|(s, id)| Field { id, ..s.clone() })
+                                .collect();
+                            Plan::Project {
+                                input: Box::new(p),
+                                exprs,
+                                schema: out,
+                            }
+                        };
+                    let lids = (0..schema.len()).map(|_| self.col_id()).collect();
+                    let rids = (0..schema.len()).map(|_| self.col_id()).collect();
+                    let mut inputs = Vec::new();
+                    for (p, fields, ids) in [(l, ls, lids), (r, rs, rids)] {
+                        // Flatten nested UNION ALLs into one Append.
+                        match conform(p, fields, &schema, ids) {
+                            Plan::Project { input, .. }
+                                if matches!(*input, Plan::Union { .. }) && all =>
+                            {
+                                if let Plan::Union { inputs: inner, .. } = *input {
+                                    inputs.extend(inner);
+                                }
+                            }
+                            p => inputs.push(p),
+                        }
+                    }
+                    let u = Plan::Union { inputs, schema };
+                    Ok(if all {
+                        u
+                    } else {
+                        Plan::Distinct { input: Box::new(u) }
+                    })
+                }
+                ast::SetExpr::Select(s) => self.bind_select(s, &[]).await,
+                ast::SetExpr::Query(q) => self.bind_query(q).await,
+                ast::SetExpr::Values(v) => self.bind_values(v, None).await,
+                other => unsupported(format!("query {other}")),
+            }
         })
     }
 
@@ -397,7 +498,12 @@ impl<'t> Binder<'t> {
                     ..
                 } => {
                     let n = object_name(name)?;
-                    if let Some(p) = self.system_table(&n).await? {
+                    if let Some(mut p) = self.system_table(&n).await? {
+                        if let (Some(a), Plan::Values { schema, .. }) = (alias, &mut p) {
+                            for f in schema.iter_mut() {
+                                f.qualifier = Some(ident(&a.name));
+                            }
+                        }
                         return Ok(p);
                     }
                     self.scan(&n, alias.as_ref().map(|a| ident(&a.name))).await
@@ -436,6 +542,29 @@ impl<'t> Binder<'t> {
 
     /// `information_schema` and `pg_catalog` views clients ask for.
     async fn system_table(&mut self, name: &str) -> Result<Option<Plan>> {
+        if let Some((cols, values)) = crate::pgcatalog::view(self.txn, name).await? {
+            let schema = cols
+                .iter()
+                .map(|(n, ty)| Field {
+                    id: self.col_id(),
+                    name: (*n).to_owned(),
+                    qualifier: Some(name.to_owned()),
+                    ty: *ty,
+                    nullable: true,
+                    hidden: false,
+                })
+                .collect();
+            let rows = values
+                .into_iter()
+                .map(|r| {
+                    r.into_iter()
+                        .zip(cols.iter())
+                        .map(|(v, (_, ty))| Expr::Literal(v, *ty))
+                        .collect()
+                })
+                .collect();
+            return Ok(Some(Plan::Values { rows, schema }));
+        }
         if name == "stowage_stat_statements" {
             let text = |s: &str| Expr::Literal(Value::Text(s.to_owned()), DataType::Text);
             let int = |v: u64| Expr::Literal(Value::Int(v as i64), DataType::Int);
@@ -861,7 +990,30 @@ impl<'t> Binder<'t> {
         Box::pin(async move {
             use ast::Expr as A;
             Ok(match e {
-                A::Identifier(i) => Expr::Column(find(scope, None, &ident(i))?.id),
+                A::Identifier(i) => match find(scope, None, &ident(i)) {
+                    Ok(f) => Expr::Column(f.id),
+                    // Postgres' niladic functions are spelled without parentheses.
+                    Err(Error::UndefinedColumn(_))
+                        if matches!(
+                            ident(i).as_str(),
+                            "current_schema"
+                                | "current_user"
+                                | "session_user"
+                                | "current_catalog"
+                                | "current_role"
+                                | "user"
+                        ) =>
+                    {
+                        match ident(i).as_str() {
+                            "current_schema" => literal_text("public"),
+                            "current_catalog" => literal_text("stowage"),
+                            _ => literal_text(
+                                self.user.as_ref().map_or("stowage", |u| u.name.as_str()),
+                            ),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                },
                 A::CompoundIdentifier(parts) => {
                     let n = parts.len();
                     if n < 2 {
@@ -873,6 +1025,26 @@ impl<'t> Binder<'t> {
                 }
                 A::Value(v) => self.literal(&v.value)?,
                 A::Nested(e) => self.bind_expr(e, scope, aggs).await?,
+                A::BinaryOp {
+                    left,
+                    op:
+                        op @ (ast::BinaryOperator::PGRegexMatch
+                        | ast::BinaryOperator::PGRegexIMatch
+                        | ast::BinaryOperator::PGRegexNotMatch
+                        | ast::BinaryOperator::PGRegexNotIMatch),
+                    right,
+                } => {
+                    let x = to_text(self.bind_expr(left, scope, aggs).await?, scope);
+                    let p = to_text(self.bind_expr(right, scope, aggs).await?, scope);
+                    use ast::BinaryOperator as B;
+                    Expr::Like {
+                        expr: Box::new(x),
+                        pattern: Box::new(p),
+                        negated: matches!(op, B::PGRegexNotMatch | B::PGRegexNotIMatch),
+                        insensitive: matches!(op, B::PGRegexIMatch | B::PGRegexNotIMatch),
+                        regex: true,
+                    }
+                }
                 A::BinaryOp { left, op, right } => {
                     let l = self.bind_expr(left, scope, aggs).await?;
                     let r = self.bind_expr(right, scope, aggs).await?;
@@ -1038,6 +1210,7 @@ impl<'t> Binder<'t> {
                         pattern: Box::new(p),
                         negated: *negated,
                         insensitive,
+                        regex: false,
                     }
                 }
                 A::Cast {
@@ -1257,9 +1430,38 @@ impl<'t> Binder<'t> {
                 ));
             }
             "version" => return Ok(literal_text("PostgreSQL 16.0 (Stowage 0.1)")),
-            "current_database" => return Ok(literal_text("stowage")),
+            "current_database" | "current_catalog" => return Ok(literal_text("stowage")),
+            // Transaction-scoped advisory locks are a write to a lock key in the
+            // statement's transaction (left as a tombstone, so nothing accumulates).
+            // Two transactions taking the same lock conflict like any two writers:
+            // one waits or gets 40001, rather than seeing `false`.
+            "pg_try_advisory_xact_lock" | "pg_advisory_xact_lock" => {
+                let key = match bound.as_slice() {
+                    [Expr::Literal(v, _)] => v.to_string(),
+                    [Expr::Literal(a, _), Expr::Literal(b, _)] => format!("{a}/{b}"),
+                    _ => return unsupported(format!("{name} with a non-constant key")),
+                };
+                let k = [b"\x01lock/".as_slice(), key.as_bytes()].concat();
+                self.txn.put(&k, b"1").await?;
+                self.txn.delete(&k).await?;
+                return Ok(if name == "pg_advisory_xact_lock" {
+                    literal_text("")
+                } else {
+                    Expr::Literal(Value::Bool(true), DataType::Bool)
+                });
+            }
+            // Session-scoped locks outlive transactions, which this model cannot
+            // hold; they are accepted and always granted (documented in compat.md).
+            "pg_try_advisory_lock" | "pg_advisory_unlock" => {
+                return Ok(Expr::Literal(Value::Bool(true), DataType::Bool));
+            }
+            "pg_advisory_lock" | "pg_advisory_unlock_all" => return Ok(literal_text("")),
             "current_schema" => return Ok(literal_text("public")),
-            "current_user" | "session_user" => return Ok(literal_text("stowage")),
+            "current_user" | "session_user" | "current_role" | "user" => {
+                return Ok(literal_text(
+                    self.user.as_ref().map_or("stowage", |u| u.name.as_str()),
+                ));
+            }
             other => return Err(Error::UndefinedFunction(other.to_owned())),
         };
         if matches!(func, Func::Coalesce | Func::Nullif) && !bound.is_empty() {
@@ -1355,11 +1557,13 @@ fn rewrite_agg(e: Expr, group: &[Expr], schema: &[Field], input: &Scope) -> Resu
                     pattern,
                     negated,
                     insensitive,
+                    regex,
                 } => Expr::Like {
                     expr: Box::new(rec(*expr)),
                     pattern: Box::new(rec(*pattern)),
                     negated,
                     insensitive,
+                    regex,
                 },
                 Expr::Case {
                     operand,
