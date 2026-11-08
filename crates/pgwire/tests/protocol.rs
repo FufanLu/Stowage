@@ -152,6 +152,10 @@ async fn scram_and_privileges() {
         connect("app", None).await.is_err(),
         "a password is now required"
     );
+    assert!(
+        stowage_common::metrics::render().contains("stowage_sql_errors_total{sqlstate=\"28P01\"}"),
+        "failed logins feed the StowageAuthFailures alert"
+    );
 
     let app = connect("app", Some("app-pw")).await.unwrap();
     app.batch_execute("INSERT INTO t VALUES (1, 'a')")

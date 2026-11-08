@@ -49,7 +49,7 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | M4 | 分布式事务、SI / SSI | ✅ |
 | M5 | SQL 引擎 + Postgres 协议 | ✅ |
 | M6 | DynamoDB API、CDC、在线 schema 变更 | ✅ |
-| M7 | 安全、备份/PITR、配额、可观测性 | |
+| M7 | 安全、备份/PITR、配额、可观测性 | ✅ |
 | M8 | 运维控制台、Helm | |
 | M9 | 压测、混沌测试、兼容性验证 | |
 
@@ -113,6 +113,23 @@ psql -h 127.0.0.1 -p 5482 -c "EXPLAIN ANALYZE SELECT * FROM t WHERE id = 1"   # 
 
 详见[图解 08](docs/illustrated/08-a-dynamodb-putitem.md)、[图解 09](docs/illustrated/09-online-add-index.md)、[兼容性](docs/compat.md#dynamodb-compatibility)。
 
+### 运维一览（M7）
+
+```bash
+stowd … --pg-tls-cert cert.pem --pg-tls-key key.pem --pg-require-tls --audit-log audit.log --slow-log slow.log
+psql -c "CREATE USER app WITH PASSWORD 's3cret' CONNECTION LIMIT 50" -c "GRANT SELECT, INSERT ON orders TO app"
+stowctl backup backups --full; stowctl backup backups          # 先全量，再增量
+stowctl --peers <新集群> restore backups --as-of "2026-11-07 12:45:42"
+docker compose -f deploy/compose/docker-compose.yml --profile observability up -d   # 加上 Prometheus、Grafana
+```
+
+- 安全：TLS（rustls）、SCRAM-SHA-256、用户管理；`GRANT`/`REVOKE` 会检查查询涉及的每一张表；另有审计日志；
+- 备份就是 changefeed 的时间窗口，所以恢复可以停在备份链里的任意时刻，比如一条忘了写 `WHERE` 的 `DELETE` 执行前的那一秒；
+- 准入控制、按用户的连接数上限，DynamoDB 的预置吞吐量用令牌桶实现；
+- Prometheus 指标、`stowage_stat_statements`、慢查询日志、带 [runbook](docs/runbooks/README.md) 的告警规则、Grafana 仪表盘、滚动升级脚本。
+
+详见[图解 10](docs/illustrated/10-backup-and-pitr.md)、[ADR 0010](docs/adr/0010-enterprise-operations.md)。
+
 ## 快速开始
 
 ```bash
@@ -121,7 +138,7 @@ make sim N=500                               # 额外跑 500 个随机仿真种�
 STOWAGE_SIM_SEED=42 cargo nextest run -p stowage-sim   # 重放某个种子
 make trace SEED=42                           # 打印一段真实的仿真 trace
 cargo run --release -p stowage-storage --example crashtest -- loop --iterations 200
-cargo run --release -p stow-bench -- engine --keys 500000
+cargo run --profile dist -p stow-bench -- engine --keys 500000
 cargo run -p stowd -- --data-dir /tmp/stowage/n1
 ```
 

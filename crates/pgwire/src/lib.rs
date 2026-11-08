@@ -427,6 +427,11 @@ impl Conn {
                     if required {
                         if !self.scram(&user).await? {
                             stowage_sql::audit::record("login_failed", &user, "SCRAM-SHA-256");
+                            stowage_common::metrics::inc(
+                                "stowage_sql_errors_total",
+                                &[("sqlstate", "28P01")],
+                                1.0,
+                            );
                             self.error_raw(
                                 "28P01",
                                 &format!("password authentication failed for user \"{user}\""),

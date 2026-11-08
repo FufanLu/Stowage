@@ -197,6 +197,22 @@ See [ADR 0004](adr/0004-btree-redo-logging.md) for the reasoning.
   [08](illustrated/08-a-dynamodb-putitem.md) and
   [09](illustrated/09-online-add-index.md).
 
+## Operations (M7)
+
+- **Security.** pgwire TLS via rustls; SCRAM-SHA-256 with salted keys at
+  `0x01 "user/<name>"`; roles, `GRANT`/`REVOKE` per table, checked in the
+  binder (reads) and DML (writes), DDL for superusers; JSON audit log.
+- **Backup / PITR.** `crates/backup`: each backup is a changefeed window over
+  the whole key space; restore picks, per key, the newest version at or before
+  the target from a gap-free chain.
+- **Quotas.** Store-thread queue capped at 20 000 (`Busy` beyond), per-user
+  `CONNECTION LIMIT`, per-table DynamoDB token buckets (5 s burst). All per node.
+- **Observability.** `stowage_common::metrics` → `/metrics`; `/health`,
+  `/status`; `stowage_stat_statements`; slow log with stage timings;
+  `deploy/prometheus`, `deploy/grafana`, [runbooks](runbooks/README.md).
+- [ADR 0010](adr/0010-enterprise-operations.md), chapter
+  [10](illustrated/10-backup-and-pitr.md).
+
 ## Status
 
 M0: workspace, environment traits, HLC and the simulator are in place.
@@ -206,5 +222,6 @@ M3: Multi-Raft key-value layer, TCP cluster, Docker compose.
 M4: distributed transactions (SI and SSI) on MVCC, verified in simulation and on a real cluster.
 M5: SQL engine and Postgres wire protocol.
 M6: changefeeds, the DynamoDB-compatible API, online index builds.
+M7: TLS, SCRAM, RBAC, audit, backup and PITR, quotas, metrics, alerts and runbooks.
 Later sections of this document are filled in as each milestone lands. The
 [illustrated chapters](illustrated/README.md) show each piece with real data.

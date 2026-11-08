@@ -56,7 +56,7 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | M4 | distributed transactions, SI / SSI | ✅ |
 | M5 | SQL engine + Postgres wire protocol | ✅ |
 | M6 | DynamoDB API, CDC, online schema change | ✅ |
-| M7 | security, backup / PITR, quotas, observability | |
+| M7 | security, backup / PITR, quotas, observability | ✅ |
 | M8 | ops console, Helm | |
 | M9 | benchmarks, chaos, compatibility runs | |
 
@@ -154,6 +154,29 @@ See [chapter 08](docs/illustrated/08-a-dynamodb-putitem.md),
 [chapter 09](docs/illustrated/09-online-add-index.md) and
 [compatibility](docs/compat.md#dynamodb-compatibility).
 
+### Operations at a glance (M7)
+
+```bash
+stowd … --pg-tls-cert cert.pem --pg-tls-key key.pem --pg-require-tls --audit-log audit.log --slow-log slow.log
+psql -c "CREATE USER app WITH PASSWORD 's3cret' CONNECTION LIMIT 50" -c "GRANT SELECT, INSERT ON orders TO app"
+stowctl backup backups --full; stowctl backup backups          # full, then incremental
+stowctl --peers <new cluster> restore backups --as-of "2026-11-07 12:45:42"
+docker compose -f deploy/compose/docker-compose.yml --profile observability up -d   # + Prometheus, Grafana
+```
+
+- TLS (rustls), SCRAM-SHA-256, users, `GRANT`/`REVOKE` checked on every table a
+  query touches, an audit log;
+- backups are changefeed windows, so a restore can stop at any moment in the
+  chain, e.g. the second before a `DELETE` without a `WHERE`;
+- admission control, per-user connection limits, DynamoDB provisioned
+  throughput as token buckets;
+- Prometheus metrics, `stowage_stat_statements`, a slow-query log, alert rules
+  with [runbooks](docs/runbooks/README.md), a Grafana dashboard, a rolling
+  upgrade script.
+
+See [chapter 10](docs/illustrated/10-backup-and-pitr.md) and
+[ADR 0010](docs/adr/0010-enterprise-operations.md).
+
 ## Quick start
 
 ```bash
@@ -162,7 +185,7 @@ make sim N=500                               # 500 fresh random simulation seeds
 STOWAGE_SIM_SEED=42 cargo nextest run -p stowage-sim   # replay one seed
 make trace SEED=42                           # print a real simulation trace
 cargo run --release -p stowage-storage --example crashtest -- loop --iterations 200
-cargo run --release -p stow-bench -- engine --keys 500000
+cargo run --profile dist -p stow-bench -- engine --keys 500000
 cargo run -p stowd -- --data-dir /tmp/stowage/n1
 ```
 
@@ -175,3 +198,4 @@ automatically), plus `cargo-nextest` and `cargo-deny`.
 - [Illustrated chapters](docs/illustrated/README.md): one request at a time, real data only
 - [Architecture decision records](docs/adr/README.md)
 - [Benchmarks](docs/benchmarks.md)
+- [Runbooks](docs/runbooks/README.md)

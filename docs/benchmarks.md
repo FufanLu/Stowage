@@ -1,17 +1,18 @@
 # Benchmarks
 
 Hardware: Apple M3 Pro (12 cores), 18 GB RAM, APFS on the internal SSD, macOS 15.
-Single-threaded, release build (`lto = "thin"`, `codegen-units = 1`). These are
+Single-threaded, `dist` profile (`lto = "thin"`, `codegen-units = 1`; the `release`
+profile skips LTO to keep test builds fast, so use `--profile dist` for numbers). These are
 single runs on a laptop: repeat runs of the same configuration varied by up to 2×.
 Compare ratios within one run, not absolute numbers across runs.
 
 Reproduce:
 
 ```bash
-cargo build --release -p stow-bench
-./target/release/stow-bench engine --engine both --keys 500000                    # 1
-./target/release/stow-bench engine --engine btree --keys 500000 --checkpoint-mib 64   # 2
-./target/release/stow-bench engine --engine both --keys 500000 --cache-mib 256    # 3
+cargo build --profile dist -p stow-bench
+./target/dist/stow-bench engine --engine both --keys 500000                    # 1
+./target/dist/stow-bench engine --engine btree --keys 500000 --checkpoint-mib 64   # 2
+./target/dist/stow-bench engine --engine both --keys 500000 --cache-mib 256    # 3
 ```
 
 Workload: 500 000 keys (`user` + 16 hex digits, 20 B) with 100 B values, inserted in
@@ -155,7 +156,7 @@ transfer in commit-timestamp order and checks the total at the end: every row
 below has 0 replay anomalies and a total of exactly 1 000 000.
 
 ```bash
-./target/release/stow-bench bank --accounts 1000 --concurrency 32 --duration 20 --presplit 6 --isolation ssi
+./target/dist/stow-bench bank --accounts 1000 --concurrency 32 --duration 20 --presplit 6 --isolation ssi
 ```
 
 | Environment | Isolation | txn/s | p50 ms | p99 ms | restarts |
