@@ -90,6 +90,9 @@ jobs:
           for _ in $(seq 1 30); do curl -fsS 127.0.0.1:9481/health && break; sleep 1; done
       - name: flyway
         run: tests/compat/flyway/run.sh 5481
+      - name: AWS SDK for Java v2 (Conveyor tracking-svc's calls)
+        working-directory: tests/compat/dynamodb-java
+        run: mvn -q -B compile exec:java -Dexec.args=http://127.0.0.1:8481
       - name: node logs on failure
         if: failure()
         run: tail -n 60 /tmp/n*.log

@@ -124,6 +124,9 @@ pub struct TableDesc {
     pub rcu: Option<u64>,
     #[serde(default)]
     pub wcu: Option<u64>,
+    /// `UpdateTimeToLive`: the attribute holding an expiry time (epoch seconds).
+    #[serde(default)]
+    pub ttl: Option<String>,
 }
 
 fn table_key(name: &str) -> Vec<u8> {
@@ -413,6 +416,15 @@ async fn dispatch(app: &App, op: &str, req: &Json) -> Result<Json> {
         "DescribeStream" | "GetShardIterator" | "GetRecords" | "ListStreams" => {
             streams(app, op, req).await
         }
+        "UpdateTimeToLive" => update_ttl(app, req).await,
+        "DescribeTimeToLive" => {
+            let name = s(req, "TableName")?.to_owned();
+            let d = txn!(app, t, get_table(t, &name))?;
+            Ok(json!({"TimeToLiveDescription": match &d.ttl {
+                Some(a) => json!({"TimeToLiveStatus": "ENABLED", "AttributeName": a}),
+                None => json!({"TimeToLiveStatus": "DISABLED"}),
+            }}))
+        }
         "DescribeEndpoints" => {
             Ok(json!({"Endpoints": [{"Address": "localhost", "CachePeriodInMinutes": 1440}]}))
         }
@@ -509,6 +521,7 @@ async fn create_table(app: &App, req: &Json) -> Result<Json> {
             stream,
             rcu,
             wcu,
+            ttl: None,
         };
         t.put(
             &table_key(&name),
@@ -1191,12 +1204,108 @@ async fn gsi_worker(app: Arc<App>) {
         return;
     };
     let me = format!("{:016x}", client.now().wall ^ u64::from(std::process::id()));
+    let mut round = 0u64;
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Err(e) = gsi_round(&app, &client, &me).await {
-            tracing::debug!(error = %e.message, "gsi worker round failed");
+        round += 1;
+        match gsi_round(&app, &client, &me).await {
+            Err(e) => tracing::debug!(error = %e.message, "gsi worker round failed"),
+            // The lease holder also expires items, about once a second.
+            Ok(true) if round.is_multiple_of(TTL_EVERY_ROUNDS) => {
+                if let Err(e) = ttl_round(&app).await {
+                    tracing::debug!(error = %e.message, "ttl round failed");
+                }
+            }
+            Ok(_) => {}
         }
     }
+}
+
+const TTL_EVERY_ROUNDS: u64 = 10;
+/// Items deleted per table per round, so one round stays a small transaction.
+const TTL_BATCH: usize = 100;
+
+/// `UpdateTimeToLive`. As in DynamoDB, enabling the attribute that is already
+/// enabled is a `ValidationException`.
+async fn update_ttl(app: &App, req: &Json) -> Result<Json> {
+    let name = s(req, "TableName")?.to_owned();
+    let spec = req["TimeToLiveSpecification"].clone();
+    let enabled = spec["Enabled"]
+        .as_bool()
+        .ok_or_else(|| DdbError::validation("TimeToLiveSpecification.Enabled is required"))?;
+    let attr = spec["AttributeName"]
+        .as_str()
+        .ok_or_else(|| DdbError::validation("TimeToLiveSpecification.AttributeName is required"))?
+        .to_owned();
+    txn!(app, t, async {
+        let mut d = get_table(t, &name).await?;
+        match (&d.ttl, enabled) {
+            (Some(a), true) if *a == attr => {
+                return Err(DdbError::validation("TimeToLive is already enabled"));
+            }
+            (Some(_), true) => {
+                return Err(DdbError::validation(
+                    "TimeToLive is active on a different AttributeName: disable it first",
+                ));
+            }
+            (None, false) => return Err(DdbError::validation("TimeToLive is already disabled")),
+            _ => {}
+        }
+        d.ttl = enabled.then(|| attr.clone());
+        t.put(
+            &table_key(&name),
+            &serde_json::to_vec(&d).map_err(|e| DdbError::internal(e.to_string()))?,
+        )
+        .await?;
+        Ok(())
+    })?;
+    Ok(json!({"TimeToLiveSpecification": {"Enabled": enabled, "AttributeName": attr}}))
+}
+
+/// Delete items whose TTL attribute (a number, epoch seconds) is in the past.
+/// The deletes are ordinary writes, so streams record them as `REMOVE` and the
+/// GSI worker drops their index entries. Like DynamoDB, deletion is background
+/// work: an expired item stays readable until a round reaches it, and items
+/// whose attribute is missing or not a number never expire.
+async fn ttl_round(app: &App) -> Result<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    txn!(app, t, async {
+        let mut deleted = 0u64;
+        for d in list_tables(t).await? {
+            let Some(attr) = &d.ttl else { continue };
+            let start = prefix(d.id, BASE);
+            let end = keycodec::prefix_end(&start);
+            let mut batch = Vec::new();
+            for (k, v) in t.scan(&start, &end, u32::MAX).await? {
+                let item = decode_item(&v)?;
+                let expired = item
+                    .get(attr)
+                    .and_then(|a| a["N"].as_str())
+                    .and_then(|n| n.parse::<f64>().ok())
+                    .is_some_and(|exp| exp < now);
+                if expired {
+                    batch.push(k);
+                    if batch.len() == TTL_BATCH {
+                        break;
+                    }
+                }
+            }
+            for k in batch {
+                t.delete(&k).await?;
+                deleted += 1;
+            }
+            if deleted > 0 {
+                stowage_common::metrics::inc(
+                    "stowage_ddb_ttl_deleted_total",
+                    &[("table", &d.name)],
+                    deleted as f64,
+                );
+            }
+        }
+        Ok(deleted)
+    })
 }
 
 /// How far the GSIs have caught up (for tests and DescribeTable).
@@ -1207,7 +1316,7 @@ pub async fn gsi_cursor(t: &mut dyn KvTxn) -> Result<Timestamp> {
         .unwrap_or(Timestamp::MIN))
 }
 
-async fn gsi_round(app: &App, client: &KvClient, me: &str) -> Result<()> {
+async fn gsi_round(app: &App, client: &KvClient, me: &str) -> Result<bool> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -1238,7 +1347,7 @@ async fn gsi_round(app: &App, client: &KvClient, me: &str) -> Result<()> {
         Ok(free)
     })?;
     if !leader {
-        return Ok(());
+        return Ok(false);
     }
     let from = txn!(app, t, gsi_cursor(t))?;
     let to = client.now();
@@ -1251,7 +1360,7 @@ async fn gsi_round(app: &App, client: &KvClient, me: &str) -> Result<()> {
     // Nothing to index: leave the cursor (a wider window next time is as
     // correct), but move it now and then so windows stay short.
     if changes.is_empty() && to.wall.saturating_sub(from.wall) < 5_000_000_000 {
-        return Ok(());
+        return Ok(true);
     }
     txn!(app, t, async {
         if gsi_cursor(t).await? != from {
@@ -1298,5 +1407,6 @@ async fn gsi_round(app: &App, client: &KvClient, me: &str) -> Result<()> {
         }
         t.put(CURSOR_KEY, ts_str(to).as_bytes()).await?;
         Ok(())
-    })
+    })?;
+    Ok(true)
 }

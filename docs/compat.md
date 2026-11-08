@@ -74,8 +74,11 @@ there yet.
 Every `stowd` serves the DynamoDB JSON protocol (`X-Amz-Target:
 DynamoDB_20120810.*` and `DynamoDBStreams_20120810.*`) on `--ddb-listen`
 (default `127.0.0.1:8480`). Point an SDK's `endpoint_url` there. Verified by
-[`tests/compat/dynamodb/smoke.py`](../tests/compat/dynamodb/smoke.py) (boto3)
-and `crates/docapi/tests/api.rs` (CI).
+[`tests/compat/dynamodb/smoke.py`](../tests/compat/dynamodb/smoke.py) (boto3),
+[`tests/compat/dynamodb-java`](../tests/compat/dynamodb-java/src/main/java/Tracking.java)
+(AWS SDK for Java 2.57, async client: every call Conveyor's tracking service
+makes, with its expressions copied verbatim, in CI) and
+`crates/docapi/tests/api.rs` (CI).
 
 | Operation | Supported | Notes |
 |---|---|---|
@@ -85,7 +88,8 @@ and `crates/docapi/tests/api.rs` (CI).
 | `BatchWriteItem`, `BatchGetItem` | ✅ | each request applied separately, as in DynamoDB |
 | `TransactWriteItems`, `TransactGetItems` | ✅ | one serializable transaction; `CancellationReasons` |
 | Streams: `ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords` | ✅ | one shard; `NEW_AND_OLD_IMAGES`; `TRIM_HORIZON`, `LATEST`, `AT/AFTER_SEQUENCE_NUMBER` |
-| `UpdateTable`, LSIs, TTL, PartiQL, backups | — | |
+| `UpdateTimeToLive`, `DescribeTimeToLive` | ✅ | expired items (a number attribute, epoch seconds, in the past) are deleted in the background, about once a second, 100 per table per round; deletes show in streams as `REMOVE` and leave the GSIs |
+| `UpdateTable`, LSIs, PartiQL, backups | — | |
 
 Expressions: comparisons, `BETWEEN`, `IN`, `AND/OR/NOT`, `attribute_exists`,
 `attribute_not_exists`, `attribute_type`, `begins_with`, `contains`, `size`;

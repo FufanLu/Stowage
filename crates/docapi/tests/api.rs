@@ -189,3 +189,109 @@ async fn provisioned_throughput_is_enforced() {
         "{throttled} of 30 throttled"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn time_to_live_expires_items() {
+    let cluster = TestCluster::start(3).await.unwrap();
+    let client = cluster.client();
+    let store: Arc<dyn KvStore> = Arc::new(ClusterKv {
+        client: client.clone(),
+    });
+    let addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let a = addr.clone();
+    tokio::spawn(async move { stowage_docapi::serve(&a, store, Some(client)).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The tracking service's events table: PK shipmentId, SK seq, TTL expiresAt.
+    call(&addr, "CreateTable", json!({
+        "TableName": "tracking_events",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [{"AttributeName": "shipmentId", "AttributeType": "S"}, {"AttributeName": "seq", "AttributeType": "N"}, {"AttributeName": "kind", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "shipmentId", "KeyType": "HASH"}, {"AttributeName": "seq", "KeyType": "RANGE"}],
+        "GlobalSecondaryIndexes": [{"IndexName": "by_kind", "KeySchema": [{"AttributeName": "kind", "KeyType": "HASH"}], "Projection": {"ProjectionType": "ALL"}}]
+    })).await;
+    let (_, d) = call(
+        &addr,
+        "DescribeTimeToLive",
+        json!({"TableName": "tracking_events"}),
+    )
+    .await;
+    assert_eq!(d["TimeToLiveDescription"]["TimeToLiveStatus"], "DISABLED");
+    let spec = json!({"TableName": "tracking_events", "TimeToLiveSpecification": {"Enabled": true, "AttributeName": "expiresAt"}});
+    let (st, r) = call(&addr, "UpdateTimeToLive", spec.clone()).await;
+    assert_eq!(
+        (st, &r["TimeToLiveSpecification"]["AttributeName"]),
+        (200, &json!("expiresAt"))
+    );
+    // Enabling it again is an error the service already tolerates.
+    let (st, e) = call(&addr, "UpdateTimeToLive", spec).await;
+    assert_eq!(st, 400);
+    assert!(
+        e["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("ValidationException"),
+        "{e}"
+    );
+    let (_, d) = call(
+        &addr,
+        "DescribeTimeToLive",
+        json!({"TableName": "tracking_events"}),
+    )
+    .await;
+    assert_eq!(d["TimeToLiveDescription"]["AttributeName"], "expiresAt");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let items = [
+        (1, Some(json!({"N": (now - 60).to_string()}))), // expired
+        (2, Some(json!({"N": (now + 3600).to_string()}))), // not yet
+        (3, None),                                       // no attribute: never expires
+        (4, Some(json!({"S": "yesterday"}))),            // not a number: never expires
+        (5, Some(json!({"N": (now - 1).to_string()}))),  // expired
+    ];
+    for (seq, exp) in &items {
+        let mut item = json!({"shipmentId": {"S": "shp-1"}, "seq": {"N": seq.to_string()}, "kind": {"S": "scan"}});
+        if let Some(e) = exp {
+            item["expiresAt"] = e.clone();
+        }
+        let (st, _) = call(
+            &addr,
+            "PutItem",
+            json!({"TableName": "tracking_events", "Item": item}),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    let seqs = |q: &Value| -> Vec<String> {
+        q["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["seq"]["N"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let query = json!({"TableName": "tracking_events", "KeyConditionExpression": "shipmentId = :s", "ExpressionAttributeValues": {":s": {"S": "shp-1"}}});
+    let gsi = json!({"TableName": "tracking_events", "IndexName": "by_kind", "KeyConditionExpression": "kind = :k", "ExpressionAttributeValues": {":k": {"S": "scan"}}});
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (_, q) = call(&addr, "Query", query.clone()).await;
+        let (_, g) = call(&addr, "Query", gsi.clone()).await;
+        let (mut a, mut b) = (seqs(&q), seqs(&g));
+        a.sort();
+        b.sort();
+        if a == ["2", "3", "4"] && b == ["2", "3", "4"] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expired items still there: base {a:?}, gsi {b:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
