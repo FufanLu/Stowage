@@ -96,6 +96,7 @@ pub async fn serve_with(
             tls.clone(),
         );
         tokio::spawn(async move {
+            stowage_common::metrics::add("stowage_sql_connections", &[], 1.0);
             let r = match negotiate(sock, &tls).await {
                 Ok((rd, wr, pending, secure)) => {
                     Conn::new(rd, wr, store, pid, pending, secure, tls.require)
@@ -104,6 +105,7 @@ pub async fn serve_with(
                 }
                 Err(e) => Err(e),
             };
+            stowage_common::metrics::add("stowage_sql_connections", &[], -1.0);
             if let Err(e) = r {
                 tracing::debug!(%peer, error = %e, "pg connection ended");
             }
@@ -135,6 +137,38 @@ async fn negotiate(
             _ => {
                 let (r, w) = sock.into_split();
                 return Ok((Box::new(r), Box::new(w), Some(body), false));
+            }
+        }
+    }
+}
+
+/// Open sessions per user on this node, for `CONNECTION LIMIT`.
+fn sessions() -> &'static std::sync::Mutex<HashMap<String, u32>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn acquire_slot(user: &str, limit: Option<u32>) -> bool {
+    let mut s = sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = s.entry(user.to_owned()).or_default();
+    if limit.is_some_and(|l| *n >= l) {
+        return false;
+    }
+    *n += 1;
+    true
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if let Some(u) = self.slot.take() {
+            let mut s = sessions()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(n) = s.get_mut(&u) {
+                *n = n.saturating_sub(1);
             }
         }
     }
@@ -265,6 +299,8 @@ fn binary(v: &Value) -> Option<Vec<u8>> {
 }
 
 struct Conn {
+    /// The user whose connection-limit slot this connection holds.
+    slot: Option<String>,
     store: Arc<dyn KvStore>,
     rd: Reader,
     wr: BufWriter<Writer>,
@@ -291,6 +327,7 @@ impl Conn {
         require_tls: bool,
     ) -> Self {
         Self {
+            slot: None,
             store: store.clone(),
             rd,
             wr: BufWriter::new(wr),
@@ -399,6 +436,21 @@ impl Conn {
                             return Ok(false);
                         }
                         stowage_sql::audit::record("login", &user, "SCRAM-SHA-256");
+                        let limit = stowage_sql::auth::lookup(&self.store, &user)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|u| u.connection_limit);
+                        if !acquire_slot(&user, limit) {
+                            self.error_raw(
+                                "53300",
+                                &format!("too many connections for role \"{user}\""),
+                            )
+                            .await?;
+                            self.wr.flush().await?;
+                            return Ok(false);
+                        }
+                        self.slot = Some(user.clone());
                         self.session.set_user(Some(user.clone()));
                     }
                     self.send(Msg::new(b'R').i32(0)).await?; // AuthenticationOk
@@ -762,7 +814,9 @@ impl Conn {
             return self.send(Msg::new(b'I')).await;
         }
         for s in stmts {
+            let started = std::time::Instant::now();
             let r = self.session.run(&s, &[]).await;
+            record(&s, &r, started);
             if trace_on() {
                 let t: Vec<String> = self
                     .session
@@ -811,7 +865,10 @@ impl Conn {
             return self.send(Msg::new(b'I')).await;
         };
         let params = p.params.clone();
-        match self.session.run(&stmt, &params).await {
+        let started = std::time::Instant::now();
+        let r = self.session.run(&stmt, &params).await;
+        record(&stmt, &r, started);
+        match r {
             Ok(out @ Output::Rows { .. }) => {
                 let rows = out.values();
                 self.send_some(portal, rows, 0, max).await
@@ -847,6 +904,30 @@ impl Conn {
         }
         self.send(Msg::new(b'C').cstr(&format!("SELECT {}", rows.len())))
             .await
+    }
+}
+
+/// Statement metrics: count and latency by kind, errors by SQLSTATE.
+fn record(stmt: &Statement, r: &stowage_sql::Result<Output>, started: std::time::Instant) {
+    use stowage_common::metrics;
+    let text = stmt.to_string();
+    let kind = text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    metrics::inc("stowage_sql_statements_total", &[("kind", &kind)], 1.0);
+    metrics::observe(
+        "stowage_sql_statement_seconds",
+        &[("kind", &kind)],
+        started.elapsed().as_secs_f64(),
+    );
+    if let Err(e) = r {
+        metrics::inc(
+            "stowage_sql_errors_total",
+            &[("sqlstate", e.sqlstate())],
+            1.0,
+        );
     }
 }
 

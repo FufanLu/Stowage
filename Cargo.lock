@@ -2135,6 +2135,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "sqlparser",
+ "stowage-common",
  "stowage-node",
  "stowage-sql",
  "tokio",
@@ -2217,7 +2218,9 @@ name = "stowd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "serde_json",
  "stowage-common",
  "stowage-docapi",
  "stowage-kv",

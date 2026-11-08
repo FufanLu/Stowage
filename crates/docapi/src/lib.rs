@@ -119,6 +119,11 @@ pub struct TableDesc {
     pub gsis: Vec<Gsi>,
     pub created: f64,
     pub stream: bool,
+    /// Provisioned read / write capacity units per second (None: on demand).
+    #[serde(default)]
+    pub rcu: Option<u64>,
+    #[serde(default)]
+    pub wcu: Option<u64>,
 }
 
 fn table_key(name: &str) -> Vec<u8> {
@@ -203,8 +208,8 @@ impl TableDesc {
             "AttributeDefinitions": self.attributes.iter().map(|a| json!({"AttributeName": a.name, "AttributeType": a.ty})).collect::<Vec<_>>(),
             "ItemCount": items.unwrap_or(0),
             "TableSizeBytes": 0,
-            "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"},
-            "ProvisionedThroughput": {"ReadCapacityUnits": 0, "WriteCapacityUnits": 0, "NumberOfDecreasesToday": 0},
+            "BillingModeSummary": {"BillingMode": if self.rcu.is_some() { "PROVISIONED" } else { "PAY_PER_REQUEST" }},
+            "ProvisionedThroughput": {"ReadCapacityUnits": self.rcu.unwrap_or(0), "WriteCapacityUnits": self.wcu.unwrap_or(0), "NumberOfDecreasesToday": 0},
         });
         if !self.gsis.is_empty() {
             d["GlobalSecondaryIndexes"] = self
@@ -293,6 +298,20 @@ async fn handle(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) ->
         ms = started.elapsed().as_secs_f64() * 1e3,
         ok = r.is_ok(),
         "ddb"
+    );
+    let result = match &r {
+        Ok(_) => "ok",
+        Err(e) => e.kind,
+    };
+    stowage_common::metrics::inc(
+        "stowage_ddb_requests_total",
+        &[("op", &op), ("result", result)],
+        1.0,
+    );
+    stowage_common::metrics::observe(
+        "stowage_ddb_request_seconds",
+        &[("op", &op)],
+        started.elapsed().as_secs_f64(),
     );
     match r {
         Ok(v) => (
@@ -448,6 +467,15 @@ async fn create_table(app: &App, req: &Json) -> Result<Json> {
     let stream = req["StreamSpecification"]["StreamEnabled"]
         .as_bool()
         .unwrap_or(false);
+    let (rcu, wcu) = if req["BillingMode"] == "PROVISIONED" {
+        let pt = &req["ProvisionedThroughput"];
+        (
+            pt["ReadCapacityUnits"].as_u64(),
+            pt["WriteCapacityUnits"].as_u64(),
+        )
+    } else {
+        (None, None)
+    };
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
@@ -479,6 +507,8 @@ async fn create_table(app: &App, req: &Json) -> Result<Json> {
             gsis,
             created,
             stream,
+            rcu,
+            wcu,
         };
         t.put(
             &table_key(&name),
@@ -505,6 +535,37 @@ async fn delete_table(app: &App, req: &Json) -> Result<Json> {
     let mut desc = d.describe(None);
     desc["TableStatus"] = "DELETING".into();
     Ok(json!({"TableDescription": desc}))
+}
+
+/// Provisioned throughput: a token bucket per (table, read|write) on this
+/// gateway, refilled at the provisioned units per second, holding up to five
+/// seconds of them (DynamoDB keeps up to 300 s of unused capacity).
+fn throttle(d: &TableDesc, write: bool, cost: f64) -> Result<()> {
+    let Some(units) = (if write { d.wcu } else { d.rcu }) else {
+        return Ok(());
+    };
+    /// (table id, is_write) → (tokens left, last refill).
+    type Buckets = BTreeMap<(u32, bool), (f64, std::time::Instant)>;
+    static BUCKETS: std::sync::OnceLock<std::sync::Mutex<Buckets>> = std::sync::OnceLock::new();
+    let mut b = BUCKETS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rate = units as f64;
+    let cap = rate * 5.0;
+    let now = std::time::Instant::now();
+    let (tokens, last) = b.entry((d.id, write)).or_insert((cap, now));
+    *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * rate).min(cap);
+    *last = now;
+    if *tokens < cost.min(cap) {
+        stowage_common::metrics::inc("stowage_ddb_throttled_total", &[("table", &d.name)], 1.0);
+        return Err(DdbError::new(
+            "ProvisionedThroughputExceededException",
+            "The level of configured provisioned throughput for the table was exceeded. Consider increasing your provisioning level with the UpdateTable API.",
+        ));
+    }
+    *tokens -= cost;
+    Ok(())
 }
 
 fn condition(req: &Json, field: &str, b: &Bindings) -> Result<Option<Cond>> {
@@ -537,6 +598,7 @@ fn key_only(d: &TableDesc, key: &Item) -> Result<Item> {
 /// DynamoDB response (else the caller only needs success).
 async fn write_one(t: &mut dyn KvTxn, op: &str, req: &Json, report: bool) -> Result<Json> {
     let d = get_table(t, s(req, "TableName")?).await?;
+    throttle(&d, op != "ConditionCheck", 1.0)?;
     let b = Bindings::from_request(req);
     let cond = condition(req, "ConditionExpression", &b)?;
     let (key, new): (Vec<u8>, Option<Item>);
@@ -635,6 +697,7 @@ async fn write_one(t: &mut dyn KvTxn, op: &str, req: &Json, report: bool) -> Res
 
 async fn get_item(t: &mut dyn KvTxn, req: &Json) -> Result<Json> {
     let d = get_table(t, s(req, "TableName")?).await?;
+    throttle(&d, false, 1.0)?;
     let key = d.base_key(&key_only(&d, &obj(req, "Key")?)?)?;
     let b = Bindings::from_request(req);
     let proj = req["ProjectionExpression"]
@@ -779,6 +842,7 @@ fn last_key(d: &TableDesc, index: Option<&Gsi>, item: &Item) -> Item {
 
 async fn query(t: &mut dyn KvTxn, req: &Json, scan: bool) -> Result<Json> {
     let d = get_table(t, s(req, "TableName")?).await?;
+    throttle(&d, false, 1.0)?;
     let b = Bindings::from_request(req);
     let index = match req["IndexName"].as_str() {
         Some(n) => Some(
@@ -840,6 +904,10 @@ async fn query(t: &mut dyn KvTxn, req: &Json, scan: bool) -> Result<Json> {
         }
     }
     let read = pairs.len();
+    // The first unit was taken up front; the rest of what was read is owed now.
+    if read > 1 {
+        let _ = throttle(&d, false, (read - 1) as f64);
+    }
     let mut items = Vec::new();
     let mut last = None;
     for (_, v) in pairs {

@@ -480,6 +480,27 @@ impl Store {
     pub fn stats(&self) -> StoreStats {
         self.stats
     }
+
+    /// Raft counters summed over this node's replicas, and (replicas, leaders).
+    pub fn raft_totals(&self) -> (stowage_raft::RaftStats, usize, usize) {
+        let mut t = stowage_raft::RaftStats::default();
+        let (mut n, mut leaders) = (0, 0);
+        for r in self.replicas.values().filter(|r| !r.uninitialized) {
+            let s = r.raft.stats();
+            t.elections += s.elections;
+            t.pre_votes += s.pre_votes;
+            t.terms_led += s.terms_led;
+            t.appends_sent += s.appends_sent;
+            t.entries_sent += s.entries_sent;
+            t.snapshots_sent += s.snapshots_sent;
+            t.rejections += s.rejections;
+            t.reads_lease += s.reads_lease;
+            t.reads_index += s.reads_index;
+            n += 1;
+            leaders += usize::from(r.raft.is_leader());
+        }
+        (t, n, leaders)
+    }
     pub fn routing(&self) -> &Routing {
         &self.routing
     }

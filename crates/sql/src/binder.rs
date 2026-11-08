@@ -436,6 +436,46 @@ impl<'t> Binder<'t> {
 
     /// `information_schema` and `pg_catalog` views clients ask for.
     async fn system_table(&mut self, name: &str) -> Result<Option<Plan>> {
+        if name == "stowage_stat_statements" {
+            let text = |s: &str| Expr::Literal(Value::Text(s.to_owned()), DataType::Text);
+            let int = |v: u64| Expr::Literal(Value::Int(v as i64), DataType::Int);
+            let float = |v: f64| Expr::Literal(Value::Float(v), DataType::Float);
+            let rows: Vec<Vec<Expr>> = crate::stats::snapshot()
+                .into_iter()
+                .map(|(q, e)| {
+                    vec![
+                        text(&q),
+                        int(e.calls),
+                        float(e.total_ms),
+                        float(e.total_ms / e.calls.max(1) as f64),
+                        float(e.max_ms),
+                        int(e.rows),
+                        int(e.errors),
+                    ]
+                })
+                .collect();
+            let cols = [
+                ("query", DataType::Text),
+                ("calls", DataType::Int),
+                ("total_ms", DataType::Float),
+                ("mean_ms", DataType::Float),
+                ("max_ms", DataType::Float),
+                ("rows", DataType::Int),
+                ("errors", DataType::Int),
+            ];
+            let schema = cols
+                .iter()
+                .map(|(n, t)| Field {
+                    id: self.col_id(),
+                    name: (*n).to_owned(),
+                    qualifier: Some(name.to_owned()),
+                    ty: *t,
+                    nullable: false,
+                    hidden: false,
+                })
+                .collect();
+            return Ok(Some(Plan::Values { rows, schema }));
+        }
         let tables = match name {
             "tables" | "pg_tables" | "columns" => catalog::list_tables(self.txn).await?,
             _ => return Ok(None),

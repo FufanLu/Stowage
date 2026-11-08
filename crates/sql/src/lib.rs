@@ -22,6 +22,7 @@ pub mod kv;
 pub mod optimizer;
 pub mod plan;
 pub mod session;
+pub mod stats;
 pub mod value;
 
 pub use kv::{ClusterKv, KvStore, MemKv};

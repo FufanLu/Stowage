@@ -8,6 +8,7 @@
 pub mod env;
 pub mod error;
 pub mod hlc;
+pub mod metrics;
 pub mod os;
 
 pub use env::{Clock, Disk, DiskFile, NodeId, Rng, Transport};

@@ -5,8 +5,8 @@ WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p stowd -p stowctl -p stow-bench \
- && mkdir -p /out && cp target/release/stowd target/release/stowctl target/release/stow-bench /out/
+    cargo build --profile dist --locked -p stowd -p stowctl -p stow-bench \
+ && mkdir -p /out && cp target/dist/stowd target/dist/stowctl target/dist/stow-bench /out/
 
 FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 stowage && mkdir -p /data && chown stowage /data

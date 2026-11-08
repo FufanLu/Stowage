@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use stowage_common::NodeId;
 use stowage_common::os::OsDisk;
-use stowage_kv::{PeerMsg, Request, Store, StoreConfig};
+use stowage_kv::{PeerMsg, Request, Response, Store, StoreConfig};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -115,6 +115,7 @@ fn store_loop(
     let mut next_token: u64 = 1;
     let mut routes: HashMap<u64, (u64, u64)> = HashMap::new();
     let mut next_tick = Instant::now() + tick;
+    let mut next_metrics = Instant::now();
     loop {
         let wait = next_tick.saturating_duration_since(Instant::now());
         let first = match rx.recv_timeout(wait) {
@@ -126,6 +127,8 @@ fn store_loop(
             let r = match input {
                 Input::Peer(from, m) => store.handle_peer(from, m),
                 Input::Client { conn, token, req } => {
+                    QUEUED.fetch_sub(1, Ordering::Relaxed);
+                    stowage_common::metrics::inc("stowage_kv_requests_total", &[], 1.0);
                     let t = next_token;
                     next_token += 1;
                     routes.insert(t, (conn, token));
@@ -170,6 +173,7 @@ fn store_loop(
         // Taking the outputs fsyncs the shared Raft log first (one fsync for all
         // ranges): nothing that depends on a vote or an entry leaves before it is
         // durable.
+        let sync_started = Instant::now();
         let (msgs, responses) = match (store.take_peer_msgs(), store.take_responses()) {
             (Ok(m), Ok(r)) => (m, r),
             (Err(e), _) | (_, Err(e)) => {
@@ -177,6 +181,17 @@ fn store_loop(
                 std::process::exit(1); // fail-stop: never send what is not durable
             }
         };
+        if !msgs.is_empty() || !responses.is_empty() {
+            stowage_common::metrics::observe(
+                "stowage_raft_log_sync_seconds",
+                &[],
+                sync_started.elapsed().as_secs_f64(),
+            );
+        }
+        if Instant::now() >= next_metrics {
+            next_metrics = Instant::now() + Duration::from_secs(1);
+            export_metrics(&store);
+        }
         for (to, m) in msgs {
             if let Some(tx) = peers.get(&to) {
                 let _ = tx.try_send(wire::frame(PEER, &m.encode()));
@@ -193,6 +208,37 @@ fn store_loop(
             }
         }
     }
+}
+
+fn export_metrics(store: &Store) {
+    use stowage_common::metrics::set;
+    let s = store.stats();
+    let (r, replicas, leaders) = store.raft_totals();
+    for (name, v) in [
+        ("stowage_kv_proposals_total", s.proposals),
+        ("stowage_kv_proposal_batches_total", s.batches),
+        ("stowage_kv_applied_total", s.applied),
+        ("stowage_kv_splits_total", s.splits),
+        (
+            "stowage_kv_snapshots_installed_total",
+            s.snapshots_installed,
+        ),
+        ("stowage_kv_snapshots_sent_total", s.snapshots_sent),
+        ("stowage_raft_elections_total", r.elections),
+        ("stowage_raft_terms_led_total", r.terms_led),
+        ("stowage_raft_entries_sent_total", r.entries_sent),
+        ("stowage_raft_append_rejections_total", r.rejections),
+        ("stowage_raft_reads_index_total", r.reads_index),
+    ] {
+        set(name, &[], v as f64);
+    }
+    set("stowage_replicas", &[], replicas as f64);
+    set(
+        "stowage_kv_queued_requests",
+        &[],
+        QUEUED.load(Ordering::Relaxed) as f64,
+    );
+    set("stowage_range_leaders", &[], leaders as f64);
 }
 
 /// Read the receiver's HELLO and check it is the node we meant to reach. A stale
@@ -259,6 +305,12 @@ async fn peer_writer(me: NodeId, peer: NodeId, addr: String, mut rx: mpsc::Recei
     }
 }
 
+/// Client requests waiting for the store thread. Above [`MAX_QUEUED`] new ones
+/// are refused with `Busy` (which clients retry with backoff) instead of
+/// growing the queue and every request's latency without bound.
+static QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_QUEUED: usize = 20_000;
+
 async fn serve_conn(
     me: NodeId,
     sock: TcpStream,
@@ -301,7 +353,8 @@ async fn serve_conn(
     clients
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(conn, tx);
+        .insert(conn, tx.clone());
+    let busy_tx = tx;
     tokio::spawn(async move {
         let mut w = BufWriter::new(wr);
         while let Some(f) = rx.recv().await {
@@ -323,9 +376,17 @@ async fn serve_conn(
         if kind == REQUEST
             && let Some((token, body)) = wire::split_token(&payload)
             && let Ok(req) = Request::decode(body)
-            && in_tx.send(Input::Client { conn, token, req }).is_err()
         {
-            break;
+            if QUEUED.load(Ordering::Relaxed) >= MAX_QUEUED {
+                stowage_common::metrics::inc("stowage_kv_requests_shed_total", &[], 1.0);
+                let busy = Response::Error(stowage_kv::KvError::Busy("node overloaded".into()));
+                let _ = busy_tx.send(wire::token_frame(RESPONSE, token, &busy.encode()));
+            } else {
+                QUEUED.fetch_add(1, Ordering::Relaxed);
+                if in_tx.send(Input::Client { conn, token, req }).is_err() {
+                    break;
+                }
+            }
         }
         next = wire::read_frame(&mut rd).await.ok().flatten();
     }

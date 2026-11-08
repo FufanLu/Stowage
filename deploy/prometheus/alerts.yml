@@ -1,0 +1,54 @@
+# Alerting rules for a Stowage cluster. Each names the runbook to follow
+# (docs/runbooks/).
+groups:
+  - name: stowage
+    rules:
+      - alert: StowageNodeDown
+        expr: up{job="stowd"} == 0
+        for: 30s
+        labels: {severity: page}
+        annotations:
+          summary: "stowd {{ $labels.instance }} is not answering /metrics"
+          runbook: docs/runbooks/node-down.md
+      - alert: StowageNoLeaders
+        expr: sum(stowage_range_leaders) < 1
+        for: 30s
+        labels: {severity: page}
+        annotations:
+          summary: "no range has a leader: the cluster cannot serve requests"
+          runbook: docs/runbooks/node-down.md
+      - alert: StowageElectionStorm
+        expr: sum(rate(stowage_raft_elections_total[1m])) > 0.5
+        for: 2m
+        labels: {severity: warn}
+        annotations:
+          summary: "more than one election every two seconds: leaders keep losing their quorum"
+          runbook: docs/runbooks/election-storm.md
+      - alert: StowageSlowFsync
+        expr: histogram_quantile(0.99, sum(rate(stowage_raft_log_sync_seconds_bucket[5m])) by (le, instance)) > 0.1
+        for: 5m
+        labels: {severity: warn}
+        annotations:
+          summary: "p99 Raft log sync above 100 ms on {{ $labels.instance }}"
+          runbook: docs/runbooks/slow-disk.md
+      - alert: StowageSerializationFailures
+        expr: sum(rate(stowage_sql_errors_total{sqlstate="40001"}[5m])) > 1
+        for: 5m
+        labels: {severity: warn}
+        annotations:
+          summary: "clients are being asked to retry transactions (SQLSTATE 40001) more than once a second"
+          runbook: docs/runbooks/contention.md
+      - alert: StowageAuthFailures
+        expr: sum(rate(stowage_sql_errors_total{sqlstate=~"28P01|42501"}[5m])) > 0.2
+        for: 5m
+        labels: {severity: warn}
+        annotations:
+          summary: "failed logins or permission errors; check the audit log"
+          runbook: docs/runbooks/security.md
+      - alert: StowageGsiLag
+        expr: sum(rate(stowage_ddb_requests_total{op=~"PutItem|UpdateItem|DeleteItem|BatchWriteItem|TransactWriteItems"}[5m])) > 0 and sum(rate(stowage_kv_applied_total[5m])) == 0
+        for: 5m
+        labels: {severity: warn}
+        annotations:
+          summary: "document writes arrive but nothing applies: GSIs and streams are stalled"
+          runbook: docs/runbooks/node-down.md

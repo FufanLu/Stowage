@@ -1,8 +1,10 @@
-# Three-node Stowage cluster.
+# Three-node Stowage cluster with Prometheus and Grafana.
 #
 #   docker compose -f deploy/compose/docker-compose.yml up -d --build
+#   psql -h localhost -p 5481                       # SQL on node 1 (5482, 5483 for the others)
+#   aws dynamodb list-tables --endpoint-url http://localhost:8481
+#   open http://localhost:3000                      # Grafana (dashboard "Stowage")
 #   docker compose -f deploy/compose/docker-compose.yml run --rm bench kv --duration 20
-#   docker compose -f deploy/compose/docker-compose.yml exec n1 stowctl --peers "$PEERS" ranges
 x-node: &node
   build:
     context: ../..
@@ -12,23 +14,44 @@ x-node: &node
   environment:
     RUST_LOG: info
     STOWAGE_PEERS: 1=n1:7001,2=n2:7001,3=n3:7001
+    STOWAGE_PG_LISTEN: 0.0.0.0:5432
+    STOWAGE_DDB_LISTEN: 0.0.0.0:8000
+    STOWAGE_HTTP_LISTEN: 0.0.0.0:9480
 
 services:
   n1:
     <<: *node
-    command: ["--node-id", "1", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data"]
+    command: ["--node-id", "1", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data", "--audit-log", "/data/audit.log", "--slow-log", "/data/slow.log"]
     volumes: ["n1:/data"]
-    ports: ["7001:7001"]
+    ports: ["7001:7001", "5481:5432", "8481:8000", "9481:9480"]
   n2:
     <<: *node
-    command: ["--node-id", "2", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data"]
+    command: ["--node-id", "2", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data", "--audit-log", "/data/audit.log", "--slow-log", "/data/slow.log"]
     volumes: ["n2:/data"]
-    ports: ["7002:7001"]
+    ports: ["7002:7001", "5482:5432", "8482:8000", "9482:9480"]
   n3:
     <<: *node
-    command: ["--node-id", "3", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data"]
+    command: ["--node-id", "3", "--listen", "0.0.0.0:7001", "--peers", "1=n1:7001,2=n2:7001,3=n3:7001", "--data-dir", "/data", "--audit-log", "/data/audit.log", "--slow-log", "/data/slow.log"]
     volumes: ["n3:/data"]
-    ports: ["7003:7001"]
+    ports: ["7003:7001", "5483:5432", "8483:8000", "9483:9480"]
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["observability"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
   bench:
     image: stowage/stowd:dev
     profiles: ["bench"]

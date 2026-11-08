@@ -56,10 +56,16 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
+# Tests and day-to-day builds: optimized, but quick to link.
 [profile.release]
 debug = "line-tables-only"
+codegen-units = 16
+
+# Benchmarks and container images: the fastest binaries.
+[profile.dist]
+inherits = "release"
 lto = "thin"
 codegen-units = 1
 
 [profile.bench]
-inherits = "release"
+inherits = "dist"

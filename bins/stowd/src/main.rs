@@ -68,6 +68,14 @@ struct Args {
     #[arg(long)]
     pg_require_tls: bool,
 
+    /// Admin HTTP listener: /metrics (Prometheus), /health, /status; empty to disable.
+    #[arg(long, default_value = "127.0.0.1:9480", env = "STOWAGE_HTTP_LISTEN")]
+    http_listen: String,
+
+    /// Append statements slower than a session's `slow_query_ms` (default 500) to this file.
+    #[arg(long)]
+    slow_log: Option<PathBuf>,
+
     /// Append audit records (logins, privilege failures, DDL, grants) to this file.
     #[arg(long)]
     audit_log: Option<PathBuf>,
@@ -107,6 +115,19 @@ async fn main() -> anyhow::Result<()> {
         ..BTreeOptions::default()
     };
     tracing::info!(node = args.node_id, ?peers, data_dir = %args.data_dir.display(), "starting stowd");
+    if !args.http_listen.is_empty() {
+        let client = std::sync::Arc::new(stowage_node::KvClient::new(peers.clone()));
+        let addr = args.http_listen.clone();
+        let node = args.node_id;
+        tokio::spawn(async move {
+            if let Err(e) = admin_http(&addr, node, client).await {
+                tracing::error!(error = %e, "admin HTTP listener failed");
+            }
+        });
+    }
+    if let Some(p) = &args.slow_log {
+        stowage_sql::stats::init_slow_log(p).context("--slow-log")?;
+    }
     if let Some(p) = &args.audit_log {
         stowage_sql::audit::init(p).context("--audit-log")?;
     }
@@ -159,4 +180,56 @@ async fn main() -> anyhow::Result<()> {
     })
     .await
     .context("node stopped")
+}
+
+/// /metrics, /health and /status (this node's view of every range, as JSON).
+async fn admin_http(
+    addr: &str,
+    node: u64,
+    client: std::sync::Arc<stowage_node::KvClient>,
+) -> std::io::Result<()> {
+    use axum::routing::get;
+    let status = move || {
+        let client = client.clone();
+        async move {
+            let ranges = client.ranges().await.unwrap_or_default();
+            let body = serde_json::json!({
+                "node": node,
+                "ranges": ranges.iter().map(|r| serde_json::json!({
+                    "id": r.desc.id,
+                    "start": String::from_utf8_lossy(&r.desc.start),
+                    "end": String::from_utf8_lossy(&r.desc.end),
+                    "start_hex": r.desc.start.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    "end_hex": r.desc.end.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    "generation": r.desc.generation,
+                    "replicas": r.desc.replicas.iter().collect::<Vec<_>>(),
+                    "leader": r.leader,
+                    "term": r.term,
+                    "bytes": r.approx_bytes,
+                })).collect::<Vec<_>>(),
+            });
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+        }
+    };
+    let app = axum::Router::new()
+        .route(
+            "/metrics",
+            get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/plain; version=0.0.4",
+                    )],
+                    stowage_common::metrics::render(),
+                )
+            }),
+        )
+        .route("/health", get(|| async { "ok\n" }))
+        .route("/status", get(status));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "admin HTTP listening");
+    axum::serve(listener, app).await
 }

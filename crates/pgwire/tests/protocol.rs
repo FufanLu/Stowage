@@ -196,6 +196,27 @@ async fn scram_and_privileges() {
         .unwrap();
     assert!(connect("app", Some("app-pw")).await.is_err());
     assert!(connect("app", Some("new-pw")).await.is_ok());
+
+    // CONNECTION LIMIT: a second session is refused, and freed when the first ends.
+    admin
+        .batch_execute("CREATE USER solo WITH PASSWORD 'pw' CONNECTION LIMIT 1")
+        .await
+        .unwrap();
+    let first = connect("solo", Some("pw")).await.unwrap();
+    assert_eq!(
+        connect("solo", Some("pw")).await.err().map(code).as_deref(),
+        Some("53300")
+    );
+    drop(first);
+    let mut again = None;
+    for _ in 0..50 {
+        if let Ok(c) = connect("solo", Some("pw")).await {
+            again = Some(c);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(again.is_some(), "the slot was not released");
 }
 
 /// TLS: `SSLRequest` → `S` → a handshake, then the protocol inside TLS; with

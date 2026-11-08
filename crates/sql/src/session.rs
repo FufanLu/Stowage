@@ -259,6 +259,33 @@ impl Session {
 
     /// Run one statement with `$n` parameters (the extended protocol).
     pub async fn run(&mut self, stmt: &Statement, params: &[Option<String>]) -> Result<Output> {
+        let started = Instant::now();
+        let r = self.run_inner(stmt, params).await;
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        if !matches!(stmt, Statement::Set(_) | Statement::ShowVariable { .. }) {
+            let text = summary_full(stmt);
+            let rows = match &r {
+                Ok(Output::Rows { batch, .. }) => batch.num_rows() as u64,
+                Ok(Output::Command(tag)) => tag
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+            crate::stats::record(&text, ms, rows, r.is_ok());
+            let threshold: f64 = self
+                .var("slow_query_ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500.0);
+            if ms >= threshold {
+                crate::stats::slow(self.who(), &text, ms, &self.timings);
+            }
+        }
+        r
+    }
+
+    async fn run_inner(&mut self, stmt: &Statement, params: &[Option<String>]) -> Result<Output> {
         self.timings.clear();
         if let Some(name) = self.user_name.clone() {
             let mut t = self.store.begin(Isolation::Serializable).await?;
@@ -703,6 +730,15 @@ impl Session {
                 .map(|f| (f.name, f.ty))
                 .collect(),
         ))
+    }
+}
+
+/// A statement's text for statistics, passwords masked.
+fn summary_full(stmt: &Statement) -> String {
+    let s = stmt.to_string();
+    match s.to_ascii_uppercase().find("PASSWORD") {
+        Some(i) => format!("{} PASSWORD ?", s[..i].trim_end()),
+        None => s,
     }
 }
 

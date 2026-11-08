@@ -138,3 +138,54 @@ async fn dynamodb_api() {
         .collect();
     assert_eq!(kinds, ["INSERT", "INSERT", "INSERT", "MODIFY"]);
 }
+
+/// Provisioned throughput: past the burst, writes are throttled the way
+/// DynamoDB throttles them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provisioned_throughput_is_enforced() {
+    let cluster = TestCluster::start(3).await.unwrap();
+    let store: Arc<dyn KvStore> = Arc::new(ClusterKv {
+        client: cluster.client(),
+    });
+    let addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let a = addr.clone();
+    tokio::spawn(async move { stowage_docapi::serve(&a, store, None).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    call(
+        &addr,
+        "CreateTable",
+        json!({
+            "TableName": "p", "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": {"ReadCapacityUnits": 100, "WriteCapacityUnits": 2},
+            "AttributeDefinitions": [{"AttributeName": "k", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "k", "KeyType": "HASH"}]
+        }),
+    )
+    .await;
+    let (_, d) = call(&addr, "DescribeTable", json!({"TableName": "p"})).await;
+    assert_eq!(d["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"], 2);
+    let mut throttled = 0;
+    for i in 0..30 {
+        let (st, e) = call(
+            &addr,
+            "PutItem",
+            json!({"TableName": "p", "Item": {"k": {"S": format!("k{i}")}}}),
+        )
+        .await;
+        if st == 400 {
+            assert_eq!(
+                e["__type"],
+                "com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException"
+            );
+            throttled += 1;
+        }
+    }
+    // 2 units/s with 5 s of burst: about 10 pass, the rest are throttled.
+    assert!(
+        (15..=25).contains(&throttled),
+        "{throttled} of 30 throttled"
+    );
+}

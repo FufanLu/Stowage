@@ -39,6 +39,9 @@ pub struct User {
     pub scram: Option<Scram>,
     /// Table → privileges.
     pub grants: BTreeMap<String, BTreeSet<String>>,
+    /// `CONNECTION LIMIT`: concurrent sessions per gateway node (None: unlimited).
+    #[serde(default)]
+    pub connection_limit: Option<u32>,
 }
 
 impl User {
@@ -167,6 +170,22 @@ pub fn random_salt() -> [u8; 16] {
     b
 }
 
+/// `CONNECTION LIMIT n` (-1: unlimited).
+fn limit(e: &sqlparser::ast::Expr) -> Result<Option<u32>> {
+    let s = match e {
+        sqlparser::ast::Expr::Value(v) => v.value.to_string(),
+        sqlparser::ast::Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            ..
+        } => return Ok(None),
+        other => other.to_string(),
+    };
+    let n: i64 = s
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("invalid CONNECTION LIMIT {s}")))?;
+    Ok(u32::try_from(n).ok())
+}
+
 fn literal(e: &sqlparser::ast::Expr) -> Result<String> {
     match e {
         sqlparser::ast::Expr::Value(v) => match &v.value {
@@ -209,6 +228,12 @@ pub async fn create_role(
                 login: cr.login.unwrap_or(true),
                 scram,
                 grants: BTreeMap::new(),
+                connection_limit: cr
+                    .connection_limit
+                    .as_ref()
+                    .map(limit)
+                    .transpose()?
+                    .flatten(),
             },
         )
         .await?;
@@ -238,6 +263,7 @@ pub async fn alter_role(
                     RoleOption::Password(Password::NullPassword) => u.scram = None,
                     RoleOption::SuperUser(b) => u.superuser = *b,
                     RoleOption::Login(b) => u.login = *b,
+                    RoleOption::ConnectionLimit(e) => u.connection_limit = limit(e)?,
                     other => return Err(Error::Unsupported(format!("role option {other}"))),
                 }
             }
