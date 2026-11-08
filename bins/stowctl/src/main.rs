@@ -46,6 +46,7 @@ enum Cmd {
     },
     /// Split the range containing `key` at `key`.
     Split {
+        /// A UTF-8 key, or hex with a `0x` prefix (`0x0200000002` = SQL table 2).
         key: String,
     },
     /// Every range: span, replicas, leader, size.
@@ -117,7 +118,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Split { key } => {
-            client.split(key.as_bytes()).await?;
+            let raw = match key.strip_prefix("0x") {
+                Some(h) => (0..h.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(h.get(i..i + 2).unwrap_or("x"), 16))
+                    .collect::<Result<Vec<u8>, _>>()
+                    .map_err(|_| anyhow::anyhow!("bad hex key"))?,
+                None => key.into_bytes(),
+            };
+            client.split(&raw).await?;
             println!("OK");
         }
         Cmd::Backup { dest, full } => {

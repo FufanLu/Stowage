@@ -5,6 +5,8 @@
 //!       --peers 1=n1:7001,2=n2:7001,3=n3:7001 --data-dir /data
 //! ```
 
+mod admin;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -72,6 +74,15 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:9480", env = "STOWAGE_HTTP_LISTEN")]
     http_listen: String,
 
+    /// Every node's admin HTTP address, `1=host:9480,2=…`, so the console can
+    /// show all of them from any one (default: only this node).
+    #[arg(long, default_value = "", env = "STOWAGE_ADMIN_PEERS")]
+    admin_peers: String,
+
+    /// Serve the console's static files (web/console/dist) on the admin listener.
+    #[arg(long, env = "STOWAGE_CONSOLE_DIR")]
+    console_dir: Option<PathBuf>,
+
     /// Append statements slower than a session's `slow_query_ms` (default 500) to this file.
     #[arg(long)]
     slow_log: Option<PathBuf>,
@@ -117,10 +128,26 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(node = args.node_id, ?peers, data_dir = %args.data_dir.display(), "starting stowd");
     if !args.http_listen.is_empty() {
         let client = std::sync::Arc::new(stowage_node::KvClient::new(peers.clone()));
+        let store: std::sync::Arc<dyn stowage_sql::KvStore> =
+            std::sync::Arc::new(stowage_sql::ClusterKv {
+                client: client.clone(),
+            });
+        let a = admin::Admin {
+            node: args.node_id,
+            client,
+            store,
+            peers: if args.admin_peers.is_empty() {
+                std::collections::BTreeMap::from([(args.node_id, args.http_listen.clone())])
+            } else {
+                parse_peers(&args.admin_peers)
+                    .map_err(anyhow::Error::msg)
+                    .context("--admin-peers")?
+            },
+            console_dir: args.console_dir.clone(),
+        };
         let addr = args.http_listen.clone();
-        let node = args.node_id;
         tokio::spawn(async move {
-            if let Err(e) = admin_http(&addr, node, client).await {
+            if let Err(e) = admin::serve(&addr, a).await {
                 tracing::error!(error = %e, "admin HTTP listener failed");
             }
         });
@@ -180,56 +207,4 @@ async fn main() -> anyhow::Result<()> {
     })
     .await
     .context("node stopped")
-}
-
-/// /metrics, /health and /status (this node's view of every range, as JSON).
-async fn admin_http(
-    addr: &str,
-    node: u64,
-    client: std::sync::Arc<stowage_node::KvClient>,
-) -> std::io::Result<()> {
-    use axum::routing::get;
-    let status = move || {
-        let client = client.clone();
-        async move {
-            let ranges = client.ranges().await.unwrap_or_default();
-            let body = serde_json::json!({
-                "node": node,
-                "ranges": ranges.iter().map(|r| serde_json::json!({
-                    "id": r.desc.id,
-                    "start": String::from_utf8_lossy(&r.desc.start),
-                    "end": String::from_utf8_lossy(&r.desc.end),
-                    "start_hex": r.desc.start.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                    "end_hex": r.desc.end.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                    "generation": r.desc.generation,
-                    "replicas": r.desc.replicas.iter().collect::<Vec<_>>(),
-                    "leader": r.leader,
-                    "term": r.term,
-                    "bytes": r.approx_bytes,
-                })).collect::<Vec<_>>(),
-            });
-            (
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                body.to_string(),
-            )
-        }
-    };
-    let app = axum::Router::new()
-        .route(
-            "/metrics",
-            get(|| async {
-                (
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        "text/plain; version=0.0.4",
-                    )],
-                    stowage_common::metrics::render(),
-                )
-            }),
-        )
-        .route("/health", get(|| async { "ok\n" }))
-        .route("/status", get(status));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "admin HTTP listening");
-    axum::serve(listener, app).await
 }

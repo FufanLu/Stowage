@@ -50,7 +50,7 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | M5 | SQL 引擎 + Postgres 协议 | ✅ |
 | M6 | DynamoDB API、CDC、在线 schema 变更 | ✅ |
 | M7 | 安全、备份/PITR、配额、可观测性 | ✅ |
-| M8 | 运维控制台、Helm | |
+| M8 | 运维控制台、Helm | ✅ |
 | M9 | 压测、混沌测试、兼容性验证 | |
 
 ### 存储引擎一览（M1）
@@ -129,6 +129,21 @@ docker compose -f deploy/compose/docker-compose.yml --profile observability up -
 - Prometheus 指标、`stowage_stat_statements`、慢查询日志、带 [runbook](docs/runbooks/README.md) 的告警规则、Grafana 仪表盘、滚动升级脚本。
 
 详见[图解 10](docs/illustrated/10-backup-and-pitr.md)、[ADR 0010](docs/adr/0010-enterprise-operations.md)。
+
+### 控制台与 Kubernetes 一览（M8）
+
+![控制台：键空间、各节点的 leader、range 列表](docs/images/console.png)
+
+```bash
+stowd … --http-listen 127.0.0.1:9481 --admin-peers 1=…:9481,2=…:9482,3=…:9483 --console-dir web/console/dist
+open http://127.0.0.1:9481                                    # 任一节点都提供控制台
+helm install t deploy/helm/stowage && kubectl port-forward svc/t-stowage 9480 5432 8000
+```
+
+- 键空间画成一条 range 带（SQL 行 `0x02`、文档 `0x03`、GSI 账本 `0x04`），并列出各节点担任的 leader、每个 range 的区间、term 和副本，数据都实时取自 `/status` 和各节点的 `/metrics`；
+- SQL shell 把 `EXPLAIN ANALYZE` 画成树，每个节点同时标出估算行数和实际行数；会修改数据的语句要按两次才执行；
+- 用表格展示 `stowage_stat_statements`，看时间花在哪些语句上；
+- Helm chart（StatefulSet、headless Service、PodDisruptionBudget），CI 在 kind 上实测，包括一次滚动重启后数据仍在。
 
 ## 快速开始
 

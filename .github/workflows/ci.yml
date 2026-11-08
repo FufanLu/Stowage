@@ -26,6 +26,43 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  console:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web/console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/console/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: typecheck and build
+        run: npm run build
+
+  kind:
+    # The Docker image, the Helm chart and a rolling restart, on a real
+    # Kubernetes (kind) cluster.
+    runs-on: ubuntu-24.04
+    needs: [console]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: stowage
+      - uses: azure/setup-helm@v4
+      - name: helm lint
+        run: helm lint deploy/helm/stowage
+      - name: build, install, smoke test
+        run: KIND_CLUSTER=stowage scripts/kind-smoke.sh
+      - name: logs on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl logs -l app.kubernetes.io/name=stowage --tail 80 --prefix
+
   test:
     name: test / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

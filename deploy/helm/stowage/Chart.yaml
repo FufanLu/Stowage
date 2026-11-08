@@ -1,0 +1,6 @@
+apiVersion: v2
+name: stowage
+description: A Stowage cluster (SQL over the Postgres protocol, a DynamoDB-compatible API, the console)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

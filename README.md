@@ -57,7 +57,7 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | M5 | SQL engine + Postgres wire protocol | ✅ |
 | M6 | DynamoDB API, CDC, online schema change | ✅ |
 | M7 | security, backup / PITR, quotas, observability | ✅ |
-| M8 | ops console, Helm | |
+| M8 | operations console, Helm | ✅ |
 | M9 | benchmarks, chaos, compatibility runs | |
 
 ### Storage engine at a glance (M1)
@@ -176,6 +176,25 @@ docker compose -f deploy/compose/docker-compose.yml --profile observability up -
 
 See [chapter 10](docs/illustrated/10-backup-and-pitr.md) and
 [ADR 0010](docs/adr/0010-enterprise-operations.md).
+
+### Console and Kubernetes at a glance (M8)
+
+![The console: key space, leaders by node, ranges](docs/images/console.png)
+
+```bash
+stowd … --http-listen 127.0.0.1:9481 --admin-peers 1=…:9481,2=…:9482,3=…:9483 --console-dir web/console/dist
+open http://127.0.0.1:9481                                    # any node serves it
+helm install t deploy/helm/stowage && kubectl port-forward svc/t-stowage 9480 5432 8000
+```
+
+- the key space as one strip of ranges (SQL rows `0x02`, documents `0x03`, GSI
+  ledger `0x04`), leaders by node, every range's span, term and replicas, all
+  live from `/status` and each node's `/metrics`;
+- a SQL shell that draws `EXPLAIN ANALYZE` as a tree with estimated and actual
+  rows; statements that change data need a second press;
+- `stowage_stat_statements` as a table of where time goes;
+- a Helm chart (StatefulSet, headless Service, PodDisruptionBudget), tested in
+  CI on kind, including a rolling restart that keeps the data.
 
 ## Quick start
 

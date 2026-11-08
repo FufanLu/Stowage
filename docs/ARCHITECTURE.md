@@ -213,6 +213,19 @@ See [ADR 0004](adr/0004-btree-redo-logging.md) for the reasoning.
 - [ADR 0010](adr/0010-enterprise-operations.md), chapter
   [10](illustrated/10-backup-and-pitr.md).
 
+## Console and deployment (M8)
+
+- **Admin API.** `bins/stowd/src/admin.rs`: `/status`, `/metrics`, `/health`,
+  `/api/nodes` (this node fetches every peer's `/metrics`, given
+  `--admin-peers`), `POST /api/sql` (HTTP Basic, checked against the stored
+  SCRAM verifier, run with that user's privileges), and the console's static
+  files (`--console-dir`).
+- **Console.** `web/console`, React + TypeScript + Vite, no UI library. Design
+  record: [`DESIGN.md`](../DESIGN.md); product record: [`PRODUCT.md`](../PRODUCT.md).
+- **Kubernetes.** `deploy/helm/stowage`: a StatefulSet whose pods derive their
+  node id from the ordinal, peers from the headless Service's DNS names, a PDB
+  of `maxUnavailable: 1`. `scripts/kind-smoke.sh` runs in CI.
+
 ## Status
 
 M0: workspace, environment traits, HLC and the simulator are in place.
@@ -223,5 +236,6 @@ M4: distributed transactions (SI and SSI) on MVCC, verified in simulation and on
 M5: SQL engine and Postgres wire protocol.
 M6: changefeeds, the DynamoDB-compatible API, online index builds.
 M7: TLS, SCRAM, RBAC, audit, backup and PITR, quotas, metrics, alerts and runbooks.
+M8: the console, its admin API, the Helm chart tested on kind.
 Later sections of this document are filled in as each milestone lands. The
 [illustrated chapters](illustrated/README.md) show each piece with real data.

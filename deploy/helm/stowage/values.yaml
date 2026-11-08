@@ -1,0 +1,32 @@
+# Nodes in the cluster. Each pod is one stowd; node ids are ordinal + 1.
+replicas: 3
+
+image:
+  repository: stowage/stowd
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Raft log and storage per node.
+storage:
+  size: 10Gi
+  storageClassName: ""
+
+resources:
+  requests: { cpu: 250m, memory: 256Mi }
+  limits: { memory: 1Gi }
+
+stowd:
+  splitMib: 64
+  cacheMib: 64
+  logJson: true
+  extraArgs: []
+
+# The client-facing Service (SQL, DynamoDB API, admin HTTP and console).
+service:
+  type: ClusterIP
+  pg: 5432
+  ddb: 8000
+  http: 9480
+
+# Scrape annotations for a Prometheus that discovers pods.
+prometheusScrape: true

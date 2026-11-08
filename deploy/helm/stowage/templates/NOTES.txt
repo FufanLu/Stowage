@@ -1,0 +1,6 @@
+Stowage: {{ .Values.replicas }} nodes.
+
+  kubectl port-forward svc/{{ include "stowage.name" . }} 5432 8000 9480
+  psql -h 127.0.0.1 -p 5432                                   # SQL
+  aws dynamodb list-tables --endpoint-url http://127.0.0.1:8000
+  open http://127.0.0.1:9480                                  # the console

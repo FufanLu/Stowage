@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "stowage.name" . }}
+  labels: {{- include "stowage.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "stowage.name" . }}-hl
+  replicas: {{ .Values.replicas }}
+  # All pods start together: range 1 needs a quorum before anything is ready.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels: {{- include "stowage.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "stowage.labels" . | nindent 8 }}
+      {{- if .Values.prometheusScrape }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.service.http }}"
+        prometheus.io/path: /metrics
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "stowage.labels" . | nindent 20 }}
+      containers:
+        - name: stowd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              exec stowd
+              --node-id "$(( ${HOSTNAME##*-} + 1 ))"
+              --listen 0.0.0.0:7001
+              --peers "$STOWAGE_PEERS"
+              --data-dir /data
+              --split-mib {{ .Values.stowd.splitMib }}
+              --cache-mib {{ .Values.stowd.cacheMib }}
+              --audit-log /data/audit.log
+              --slow-log /data/slow.log
+              {{- if .Values.stowd.logJson }} --log-json{{ end }}
+              {{- range .Values.stowd.extraArgs }} {{ . }}{{ end }}
+          env:
+            - name: STOWAGE_PEERS
+              value: {{ include "stowage.peers" (dict "ctx" . "port" 7001) | quote }}
+            - name: STOWAGE_ADMIN_PEERS
+              value: {{ include "stowage.peers" (dict "ctx" . "port" .Values.service.http) | quote }}
+            - { name: STOWAGE_PG_LISTEN, value: "0.0.0.0:5432" }
+            - { name: STOWAGE_DDB_LISTEN, value: "0.0.0.0:8000" }
+            - { name: STOWAGE_HTTP_LISTEN, value: "0.0.0.0:{{ .Values.service.http }}" }
+          ports:
+            - { name: raft, containerPort: 7001 }
+            - { name: pg, containerPort: 5432 }
+            - { name: ddb, containerPort: 8000 }
+            - { name: http, containerPort: {{ .Values.service.http }} }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storage.storageClassName }}
+        storageClassName: {{ .Values.storage.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}

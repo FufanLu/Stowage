@@ -1,0 +1,27 @@
+# Headless: stable per-pod DNS names for Raft peers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stowage.name" . }}-hl
+  labels: {{- include "stowage.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{- include "stowage.labels" . | nindent 4 }}
+  ports:
+    - { name: raft, port: 7001 }
+    - { name: http, port: {{ .Values.service.http }} }
+---
+# Clients: any node is a gateway for SQL and the DynamoDB API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stowage.name" . }}
+  labels: {{- include "stowage.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "stowage.labels" . | nindent 4 }}
+  ports:
+    - { name: pg, port: {{ .Values.service.pg }}, targetPort: pg }
+    - { name: ddb, port: {{ .Values.service.ddb }}, targetPort: ddb }
+    - { name: http, port: {{ .Values.service.http }}, targetPort: http }

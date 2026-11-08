@@ -754,8 +754,21 @@ impl Store {
                 return Ok(());
             }
             Request::Ranges => {
-                self.client_out
-                    .push((token, Response::Ranges(self.routing.all())));
+                // Gossip lags by up to one heartbeat; this node's own replicas
+                // know their leader and term now.
+                let mut all = self.routing.all();
+                for info in &mut all {
+                    if let Some(r) = self.replicas.get(&info.desc.id)
+                        && !r.uninitialized
+                        && r.desc.generation == info.desc.generation
+                        && r.raft.term() >= info.term
+                        && r.raft.leader().is_some()
+                    {
+                        info.leader = r.raft.leader();
+                        info.term = r.raft.term();
+                    }
+                }
+                self.client_out.push((token, Response::Ranges(all)));
                 return Ok(());
             }
             Request::Status => {

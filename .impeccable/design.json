@@ -1,0 +1,528 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-08T09:25:47+00:00",
+  "title": "Design System: Stowage Console",
+  "extensions": {
+    "colorMeta": {
+      "paper": {
+        "role": "neutral",
+        "displayName": "Listing Stock",
+        "purpose": "The sheet, tables, inputs, sticky carriage.",
+        "canonical": "#fbfcf8",
+        "dark": "#121612",
+        "tonalRamp": [
+          "#0b0b09",
+          "#252523",
+          "#42423f",
+          "#61625e",
+          "#82837f",
+          "#a4a5a2",
+          "#c9cac6",
+          "#eeefeb"
+        ]
+      },
+      "paper-2": {
+        "role": "neutral",
+        "displayName": "Desk",
+        "purpose": "The page behind the sheet.",
+        "canonical": "#f2f5ef",
+        "dark": "#171c18",
+        "tonalRamp": [
+          "#0a0c08",
+          "#242622",
+          "#41433e",
+          "#60625d",
+          "#81837e",
+          "#a3a6a0",
+          "#c7cac4",
+          "#edf0ea"
+        ]
+      },
+      "band": {
+        "role": "neutral",
+        "displayName": "Greenbar",
+        "purpose": "Row banding, hover fills.",
+        "canonical": "#e4f0e6",
+        "dark": "#1a231c",
+        "tonalRamp": [
+          "#060d07",
+          "#1f2820",
+          "#3b453d",
+          "#5a645c",
+          "#7b867d",
+          "#9da89f",
+          "#c1cdc3",
+          "#e6f2e8"
+        ]
+      },
+      "band-2": {
+        "role": "neutral",
+        "displayName": "Deep Greenbar",
+        "purpose": "Hover on banded rows and spans.",
+        "canonical": "#d3e6d7",
+        "dark": "#22302550",
+        "tonalRamp": [
+          "#030f06",
+          "#1a291e",
+          "#37473b",
+          "#566659",
+          "#76887a",
+          "#98aa9c",
+          "#bccfc0",
+          "#e1f4e5"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Carbon",
+        "purpose": "All data, table frames, primary button fill.",
+        "canonical": "#18201a",
+        "dark": "#dce6dd",
+        "tonalRamp": [
+          "#060d08",
+          "#1f2721",
+          "#3c453e",
+          "#5b645d",
+          "#7b857e",
+          "#9ea8a0",
+          "#c2ccc4",
+          "#e7f2e9"
+        ]
+      },
+      "ink-2": {
+        "role": "neutral",
+        "displayName": "Faded Carbon",
+        "purpose": "Secondary text, listing headers, ledes.",
+        "canonical": "#47554a",
+        "dark": "#a3b3a6",
+        "tonalRamp": [
+          "#040e06",
+          "#1c291f",
+          "#38463b",
+          "#57665a",
+          "#78877b",
+          "#9aaa9d",
+          "#becec1",
+          "#e3f4e6"
+        ]
+      },
+      "ink-3": {
+        "role": "neutral",
+        "displayName": "Ghost Carbon",
+        "purpose": "Sources, axis labels, units, nulls.",
+        "canonical": "#5f6d62",
+        "dark": "#7f9083",
+        "tonalRamp": [
+          "#040e06",
+          "#1c291f",
+          "#39463c",
+          "#58655b",
+          "#78877b",
+          "#9baa9e",
+          "#becec2",
+          "#e3f3e7"
+        ]
+      },
+      "rule": {
+        "role": "neutral",
+        "displayName": "Ruled Line",
+        "purpose": "Inner dividers, plan connectors.",
+        "canonical": "#a9c1ad",
+        "dark": "#3a4d3f",
+        "tonalRamp": [
+          "#010f04",
+          "#172a1b",
+          "#334837",
+          "#526856",
+          "#738976",
+          "#95ac99",
+          "#b8d1bc",
+          "#ddf6e1"
+        ]
+      },
+      "perf": {
+        "role": "neutral",
+        "displayName": "Perforation",
+        "purpose": "Dashed section breaks, tractor borders, cell separators.",
+        "canonical": "#c6d6c8",
+        "dark": "#2b392f",
+        "tonalRamp": [
+          "#040e06",
+          "#1c291e",
+          "#39463b",
+          "#576659",
+          "#78877a",
+          "#9aaa9c",
+          "#becec0",
+          "#e3f4e5"
+        ]
+      },
+      "hole": {
+        "role": "neutral",
+        "displayName": "Punch Hole",
+        "purpose": "Tractor-feed hole fill only.",
+        "canonical": "#e9ede6",
+        "dark": "#0b0e0b",
+        "tonalRamp": [
+          "#0a0c08",
+          "#232621",
+          "#40433e",
+          "#5f625d",
+          "#80847d",
+          "#a3a6a0",
+          "#c7cbc4",
+          "#ecf0e9"
+        ]
+      },
+      "hole-edge": {
+        "role": "neutral",
+        "displayName": "Punch Hole Edge",
+        "purpose": "Tractor-feed hole rim only.",
+        "canonical": "#c4cfc5",
+        "dark": "#2b392f",
+        "tonalRamp": [
+          "#060d07",
+          "#1f2820",
+          "#3c453d",
+          "#5b645b",
+          "#7b857c",
+          "#9ea89f",
+          "#c2cdc3",
+          "#e7f2e8"
+        ]
+      },
+      "lead": {
+        "role": "primary",
+        "displayName": "Ledger Green",
+        "purpose": "Leader and healthy ink, focus ring, caret, time bars, links.",
+        "canonical": "#17663a",
+        "dark": "#79d197",
+        "tonalRamp": [
+          "#001500",
+          "#003209",
+          "#005126",
+          "#267245",
+          "#4b9465",
+          "#6fb887",
+          "#93ddaa",
+          "#b8ffcf"
+        ]
+      },
+      "lead-wash": {
+        "role": "primary",
+        "displayName": "Ledger Wash",
+        "purpose": "Green-tinted fill.",
+        "canonical": "#cfe8d6",
+        "dark": "#1d3a27",
+        "tonalRamp": [
+          "#000f05",
+          "#162a1d",
+          "#334839",
+          "#526858",
+          "#728979",
+          "#94ac9b",
+          "#b8d0bf",
+          "#ddf6e4"
+        ]
+      },
+      "fault": {
+        "role": "secondary",
+        "displayName": "Ribbon Red",
+        "purpose": "Faults and armed destructive actions only.",
+        "canonical": "#b0251c",
+        "dark": "#ff8d84",
+        "tonalRamp": [
+          "#360000",
+          "#5c0000",
+          "#820000",
+          "#a92f25",
+          "#d15547",
+          "#f97969",
+          "#ff9e8b",
+          "#ffc3b0"
+        ]
+      },
+      "fault-wash": {
+        "role": "secondary",
+        "displayName": "Ribbon Wash",
+        "purpose": "Fault spans, error boxes, banners.",
+        "canonical": "#f8dcd8",
+        "dark": "#45201d",
+        "tonalRamp": [
+          "#160605",
+          "#331f1d",
+          "#523c39",
+          "#725b57",
+          "#957c78",
+          "#b89e9a",
+          "#ddc2be",
+          "#ffe7e3"
+        ]
+      },
+      "warn": {
+        "role": "secondary",
+        "displayName": "Carbon Amber",
+        "purpose": "Warning ink; defined, not yet used by a component.",
+        "canonical": "#8a5a00",
+        "dark": "#f0c060",
+        "tonalRamp": [
+          "#230000",
+          "#421700",
+          "#633600",
+          "#855600",
+          "#a9772e",
+          "#ce9a53",
+          "#f4be77",
+          "#ffe49c"
+        ]
+      },
+      "sel": {
+        "role": "neutral",
+        "displayName": "Selection",
+        "purpose": "Selected range, expanded row, text selection.",
+        "canonical": "#b9dcc2",
+        "dark": "#29462f",
+        "tonalRamp": [
+          "#001102",
+          "#0e2c19",
+          "#2c4a35",
+          "#4b6a53",
+          "#6b8c74",
+          "#8daf96",
+          "#b1d3ba",
+          "#d5f9df"
+        ]
+      }
+    },
+    "themes": [
+      {
+        "name": "light",
+        "selector": ":root",
+        "purpose": "Default listing paper."
+      },
+      {
+        "name": "dark",
+        "selector": "@media (prefers-color-scheme: dark) :root:not([data-theme=light]), :root[data-theme=dark]",
+        "purpose": "The same paper under low light; every token keeps its role. No in-app toggle; data-theme is honoured if set."
+      }
+    ],
+    "typographyMeta": {
+      "wordmark": {
+        "displayName": "Wordmark",
+        "purpose": "STOWAGE in the carriage, uppercase."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Section titles; same size as the wordmark."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Prose and ledes (13px, 72ch)."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Source lines, legends, detail terms."
+      },
+      "data": {
+        "displayName": "Data",
+        "purpose": "Every machine-produced value; ligatures off."
+      },
+      "data-small": {
+        "displayName": "Data Small",
+        "purpose": "Span cells, node cells, plan details."
+      }
+    },
+    "shadows": [
+      {
+        "name": "sheet-lift",
+        "value": "0 1px 3px rgb(0 0 0 / 0.06), 0 8px 28px rgb(0 0 0 / 0.05)",
+        "purpose": "The sheet only."
+      },
+      {
+        "name": "selected-span",
+        "value": "inset 0 -3px 0 var(--lead)",
+        "purpose": "Selected range in the key-space strip."
+      },
+      {
+        "name": "editor-focus",
+        "value": "inset 0 0 0 2px var(--lead)",
+        "purpose": "SQL textarea focus."
+      }
+    ],
+    "motion": [
+      {
+        "name": "skeleton-feed",
+        "value": "feed 1.2s steps(2, end) infinite",
+        "purpose": "Loading skeleton steps in opacity; disabled under prefers-reduced-motion."
+      },
+      {
+        "name": "press",
+        "value": "translateY(1px)",
+        "purpose": "Button active state; no transition."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "narrow",
+        "value": "760px",
+        "purpose": "Tractor margins hidden, 16px gutter, tabs full width, secondary columns hidden, scroll-edge fade."
+      }
+    ],
+    "decisions": [
+      {
+        "name": "Tabs in the carriage",
+        "body": "View tabs are folder tabs in the carriage header, not on the tractor margin, because the margins are hidden at 760px and below."
+      },
+      {
+        "name": "Dark theme",
+        "body": "Follows prefers-color-scheme and data-theme, as the paper under low light."
+      },
+      {
+        "name": "Column ruler removed",
+        "body": "A decorative column ruler was built and removed at review because it measured nothing."
+      },
+      {
+        "name": "Leader grid is presence only",
+        "body": "The leader grid shows who holds which range. Encoding request load as heat is an open idea, not built."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Button",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "Default action button: paper fill, ink border.",
+      "html": "<button class=\"ds-btn\">Explain</button>",
+      "css": ".ds-btn{appearance:none;font:600 13px var(--font-ui);font-variation-settings:'wdth' 92;padding:6px 13px;border-radius:3px;border:1px solid var(--ink);background:var(--paper);color:var(--ink);cursor:pointer}.ds-btn:hover{background:var(--band)}.ds-btn:active{transform:translateY(1px)}.ds-btn:focus-visible{outline:2px solid var(--lead);outline-offset:2px}"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Run: ink fill, turns ledger green on hover.",
+      "html": "<button class=\"ds-btn-primary\">Run</button>",
+      "css": ".ds-btn-primary{appearance:none;font:600 13px var(--font-ui);padding:6px 13px;border-radius:3px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);cursor:pointer}.ds-btn-primary:hover{background:var(--lead);border-color:var(--lead)}.ds-btn-primary:active{transform:translateY(1px)}.ds-btn-primary:focus-visible{outline:2px solid var(--lead);outline-offset:2px}"
+    },
+    {
+      "name": "Armed Button",
+      "kind": "button",
+      "refersTo": "button-armed",
+      "description": "Destructive statement after first press; second press within 4 s runs it.",
+      "html": "<button class=\"ds-btn-armed\">Run</button> <span class=\"ds-guard\">This changes or removes data. Run again within 4 s to confirm.</span>",
+      "css": ".ds-btn-armed{appearance:none;font:600 13px var(--font-ui);padding:6px 13px;border-radius:3px;border:1px solid var(--fault);background:var(--fault);color:#fff;cursor:pointer}.ds-btn-armed:focus-visible{outline:2px solid var(--lead);outline-offset:2px}.ds-guard{font:12px var(--font-ui);color:var(--fault)}"
+    },
+    {
+      "name": "Credential Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Mono field on paper with a ruled border.",
+      "html": "<input class=\"ds-input\" value=\"root\" aria-label=\"user\">",
+      "css": ".ds-input{font:12.5px var(--font-data);padding:5px 8px;border:1px solid var(--rule);border-radius:2px;background:var(--paper);color:var(--ink);width:9.5rem}.ds-input:focus-visible{outline:2px solid var(--lead);outline-offset:0;border-color:var(--lead)}"
+    },
+    {
+      "name": "Folder Tabs",
+      "kind": "nav",
+      "refersTo": "tab",
+      "description": "View tabs in the carriage; the selected tab opens into the page over the ink baseline.",
+      "html": "<nav class=\"ds-tabs\" role=\"tablist\"><button class=\"ds-tab\" role=\"tab\" aria-selected=\"true\">Cluster</button><button class=\"ds-tab\" role=\"tab\" aria-selected=\"false\">SQL</button><button class=\"ds-tab\" role=\"tab\" aria-selected=\"false\">Statements</button></nav>",
+      "css": ".ds-tabs{display:flex;gap:2px;border-bottom:1px solid var(--ink);padding-top:8px}.ds-tab{appearance:none;border:1px solid transparent;border-bottom:0;background:none;color:var(--ink-2);font:500 13px var(--font-ui);padding:7px 14px 9px;cursor:pointer;border-radius:3px 3px 0 0;margin-bottom:-1px}.ds-tab:hover{color:var(--ink);background:var(--band)}.ds-tab[aria-selected=true]{color:var(--ink);background:var(--paper);border-color:var(--ink);font-weight:650}.ds-tab:focus-visible{outline:2px solid var(--lead);outline-offset:2px}"
+    },
+    {
+      "name": "Node Cells",
+      "kind": "custom",
+      "refersTo": null,
+      "description": "Ruled line of node health cells in the carriage.",
+      "html": "<div class=\"ds-nodes\"><div class=\"ds-node\"><b>n1</b><span class=\"st\">up</span><small>2 leading · 0 ms rtt</small></div><div class=\"ds-node down\"><b>n2</b><span class=\"st\">down</span><small>no answer</small></div></div>",
+      "css": ".ds-nodes{display:flex}.ds-node{display:grid;grid-template-columns:auto auto;gap:0 8px;align-items:baseline;padding:2px 12px;border-left:1px solid var(--perf);font:12px var(--font-data);color:var(--ink)}.ds-node:first-child{border-left:0}.ds-node b{font-weight:700}.ds-node .st{color:var(--lead)}.ds-node.down .st,.ds-node.down b{color:var(--fault)}.ds-node small{grid-column:1/-1;color:var(--ink-3);font-size:11px;white-space:nowrap}"
+    },
+    {
+      "name": "Greenbar Listing",
+      "kind": "card",
+      "refersTo": "listing-row",
+      "description": "Mono table banded in pairs, ink rules top and bottom.",
+      "html": "<table class=\"ds-listing\"><thead><tr><th>range</th><th>leader</th><th class=\"num\">size</th></tr></thead><tbody><tr><td>r1</td><td class=\"ld\">n2</td><td class=\"num\">65.5 KiB</td></tr><tr><td>r1.1</td><td class=\"ld\">n3</td><td class=\"num\">407 B</td></tr><tr><td>r1.2</td><td class=\"ld\">n2</td><td class=\"num\">17.0 KiB</td></tr><tr class=\"sel\"><td>r1.3</td><td class=\"ld\">n3</td><td class=\"num\">81.4 KiB</td></tr></tbody></table>",
+      "css": ".ds-listing{width:100%;border-collapse:collapse;border-top:1px solid var(--ink);border-bottom:1px solid var(--ink);color:var(--ink)}.ds-listing th{text-align:left;font:600 11.5px var(--font-ui);color:var(--ink-2);padding:6px 12px;border-bottom:1px solid var(--rule);background:var(--paper)}.ds-listing td{padding:0 12px;height:1.75rem;font:12.5px var(--font-data);white-space:nowrap}.ds-listing .num{text-align:right}.ds-listing .ld{color:var(--lead);font-weight:700}.ds-listing tbody tr:nth-child(4n+1) td,.ds-listing tbody tr:nth-child(4n+2) td{background:var(--band)}.ds-listing tbody tr{cursor:pointer}.ds-listing tbody tr:hover td{background:var(--band-2)}.ds-listing tbody tr.sel td{background:var(--sel)}"
+    },
+    {
+      "name": "Key-Space Strip",
+      "kind": "custom",
+      "refersTo": null,
+      "description": "Ranges in key order, width by sqrt(bytes), leader in green, fault in red.",
+      "html": "<div class=\"ds-strip\"><button class=\"ds-span\"><b>r1</b><i>n2</i><span>-∞</span><small>65.5 KiB</small></button><button class=\"ds-span\" aria-pressed=\"true\"><b>r1.1</b><i>n3</i><span>sql</span><small>407 B</small></button><button class=\"ds-span fault\"><b>r1.2</b><i class=\"none\">no leader</i><span>table 2 · index 1</span><small>17.0 KiB</small></button></div>",
+      "css": ".ds-strip{display:flex;border:1px solid var(--ink);background:var(--paper)}.ds-span{flex:1;min-width:74px;appearance:none;border:0;border-left:1px solid var(--rule);background:var(--paper);color:var(--ink);text-align:left;padding:6px 7px 7px;display:flex;flex-direction:column;gap:2px;cursor:pointer;font:11.5px var(--font-data)}.ds-span:first-child{border-left:0}.ds-span:nth-child(even){background:var(--band)}.ds-span:hover{background:var(--band-2)}.ds-span:focus-visible{outline:2px solid var(--lead);outline-offset:2px}.ds-span[aria-pressed=true]{background:var(--sel);box-shadow:inset 0 -3px 0 var(--lead)}.ds-span b{font-size:12px}.ds-span i{font-style:normal;color:var(--lead)}.ds-span i.none{color:var(--fault);font-weight:700}.ds-span span{color:var(--ink-2)}.ds-span small{font-size:11px;color:var(--ink-3)}.ds-span.fault{background:var(--fault-wash)}"
+    },
+    {
+      "name": "Leader Grid Marks",
+      "kind": "chip",
+      "refersTo": "cellmark-leader",
+      "description": "Presence marks: leader, follower, orphaned replica. Not a heat map.",
+      "html": "<span class=\"ds-mark lead\">L</span> <span class=\"ds-mark rep\">·</span> <span class=\"ds-mark orphan\">·</span>",
+      "css": ".ds-mark{display:inline-grid;place-items:center;width:22px;height:18px;border-radius:2px;font:700 12px var(--font-data)}.ds-mark.lead{background:var(--lead);color:var(--paper)}.ds-mark.rep{border:1px solid var(--ink-3);color:var(--ink-3);font-weight:400}.ds-mark.orphan{border:1px dashed var(--fault);color:var(--fault);font-weight:400}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Greenbar Listing",
+    "overview": "The console is a continuous-form line-printer listing. The key space is one long printout on white stock with pale green bands, the page sits between tractor-feed margins with punched holes, sections are torn apart at perforations, and data is struck in carbon ink. Ranges are the pages of the listing; nodes are the carriage columns across the top. It deliberately refuses the graphite dev console with neon charts that most database consoles ship.\n\nDensity is high and calm: small type, tight rows, almost no chrome. Every visible line is armature, not ornament. Greenbar bands exist to carry the eye along a row, perforations exist to mark a section break, rules exist to bound a table. Colour carries state and nothing else: ledger green means \"leads\" or \"healthy\", ribbon red means \"fault\" (no leader, node down, destructive action armed). Everything else is ink on paper.\n\nUnder low light the same paper turns dark: a dark theme follows `prefers-color-scheme` and can be forced with `data-theme=\"dark\"` or `data-theme=\"light\"` on the root. It is the same listing read under a desk lamp, not a separate \"dark mode\" style: every token keeps its role, only its value changes.",
+    "keyCharacteristics": [
+      "Paper ground, greenbar banding, carbon ink; colour reserved for leader (green) and fault (red).",
+      "Line-printer mono for every number, key, identifier and plan; a narrowed grotesk for labels and prose.",
+      "Tractor-feed margins and dashed perforations frame the sheet on wide screens.",
+      "Flat surfaces bounded by hairlines; one soft ambient shadow lifts the sheet off the desk.",
+      "Light and dark are the same paper under different light."
+    ],
+    "rules": [
+      {
+        "name": "The Two Inks Rule",
+        "body": "Green means leads or healthy; red means fault. No other hue appears, and neither is ever used for decoration or emphasis.",
+        "section": "colors"
+      },
+      {
+        "name": "The Same Paper Rule",
+        "body": "The dark theme is the paper under low light, not a restyle. Add a token to both themes or to neither; never branch a component on the theme.",
+        "section": "colors"
+      },
+      {
+        "name": "The Machine Ink Rule",
+        "body": "If the cluster produced it (a number, key, id, node name, statement, plan), it is set in mono. If a person wrote it (a label, a heading, an explanation), it is set in the grotesk.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat Scale Rule",
+        "body": "No type above 15px. A section is found by its rule and its weight, never by a large heading.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabs In The Carriage Rule",
+        "body": "View tabs sit in the carriage header as folder tabs, not on the tractor margin. The margins are hidden at 760px and below, so anything placed on them would vanish on a phone.",
+        "section": "layout"
+      },
+      {
+        "name": "The Armature Rule",
+        "body": "A visible grid line must measure or separate something real. Greenbar bands carry row scanning and perforations mark section breaks. A decorative column ruler was built across the top of the sheet, measured nothing, and was removed at review; do not bring it back.",
+        "section": "layout"
+      },
+      {
+        "name": "The One Lift Rule",
+        "body": "Only the sheet casts a shadow. Panels, buttons and tables stay flat on the paper.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** set every machine-produced value in JetBrains Mono with tabular numerals and ligatures off.",
+      "**Do** keep greenbar row pitch at 1.75rem across listings, the editor and skeletons.",
+      "**Do** use ledger green only for leader or healthy, and ribbon red only for faults or armed destructive actions.",
+      "**Do** keep view navigation in the carriage header so it survives the hidden tractor margins at 760px and below.",
+      "**Do** define every new colour token in both the light and the dark theme.",
+      "**Do** hold destructive SQL behind a second press, separate from Run."
+    ],
+    "donts": [
+      "**Don't** add grid lines, rulers or scales that measure nothing; the removed column ruler is the precedent.",
+      "**Don't** add shadows beyond the sheet lift, or rounded cards.",
+      "**Don't** set type above 15px or add a display tier.",
+      "**Don't** use colour for decoration, category or emphasis; a third signal hue needs a real state to carry.",
+      "**Don't** shade the leader grid by load or otherwise imply heat data until that encoding is actually built from live metrics.",
+      "**Don't** show numbers the cluster did not report; missing values print as an en dash."
+    ]
+  }
+}
