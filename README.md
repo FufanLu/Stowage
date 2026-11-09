@@ -43,7 +43,7 @@ flowchart TB
 Stowage is deliberately **CP**: a write is acknowledged only once a Raft majority has
 it. Its companion project [Cartwheel](https://github.com/FufanLu/Cartwheel) is a
 leaderless, always-writable Dynamo-style (AP) store. Milestone M9 benchmarks the two
-side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
+side by side ([chapter 11](docs/illustrated/11-ap-vs-cp.md)). See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 
 ## Status
 
@@ -58,7 +58,7 @@ side by side. See [ADR 0003](docs/adr/0003-layered-cp-architecture.md).
 | M6 | DynamoDB API, CDC, online schema change | ✅ |
 | M7 | security, backup / PITR, quotas, observability | ✅ |
 | M8 | operations console, Helm | ✅ |
-| M9 | benchmarks, chaos, compatibility runs | |
+| M9 | benchmarks, chaos, compatibility runs | ✅ |
 
 ### Storage engine at a glance (M1)
 
@@ -196,6 +196,30 @@ helm install t deploy/helm/stowage && kubectl port-forward svc/t-stowage 9480 54
 - a Helm chart (StatefulSet, headless Service, PodDisruptionBudget), tested in
   CI on kind, including a rolling restart that keeps the data.
 
+### AP vs CP, chaos and compatibility at a glance (M9)
+
+YCSB-A, zipfian(0.99), 32 clients, three nodes each, node 2 killed or frozen for
+10 s ([chapter 11](docs/illustrated/11-ap-vs-cp.md), [benchmarks](docs/benchmarks.md#m9--ap-vs-cp-benchap-vs-cpsh)):
+
+| | healthy | node killed | node frozen | errors |
+|---|---:|---:|---:|---:|
+| Cartwheel (AP, no fsync) | 15 353 ops/s | 17 668 | 10 293 | 11 timeouts |
+| Stowage, serializable, `--unsafe-skip-fsync` | 12 221 ops/s | 9 896 | 9 353 | 0 |
+| Stowage, serializable, fsync | 196 ops/s | 228 | 218 | 0 |
+
+- With the same durability, the CP store with serializable read-modify-writes
+  reaches 80 % of the AP store; `F_FULLFSYNC`, not consensus, is the cost.
+- The first run did 26 ops/s with a p99 of 49 s. Fixing it meant a pipelined
+  log sync, locking reads, and a lock wait queue on the leaseholder
+  ([ADR 0011](docs/adr/0011-contention-and-group-commit.md)).
+- A node restart caused a snapshot storm. Fixing that exposed a zombie
+  replica that committed a conflicting entry in simulation; tombstones,
+  generations on Raft messages and replica GC now prevent it.
+- `scripts/chaos.sh`: serializable bank transfers under random kills and
+  freezes, money conserved, 0 replay anomalies.
+- Conveyor's and Milkrun's Flyway migrations apply unchanged, and a Java AWS
+  SDK client runs against the DynamoDB API in CI ([compatibility](docs/compat.md)).
+
 ## Quick start
 
 ```bash
@@ -214,6 +238,7 @@ automatically), plus `cargo-nextest` and `cargo-deny`.
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [PRFAQ](docs/PRFAQ.md): the launch press release and FAQ, written backwards from the results
 - [Illustrated chapters](docs/illustrated/README.md): one request at a time, real data only
 - [Architecture decision records](docs/adr/README.md)
 - [Benchmarks](docs/benchmarks.md)

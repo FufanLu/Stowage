@@ -36,7 +36,7 @@ flowchart TB
   kv -.-> sched["调度器<br/>（由 range 1 的 leader 运行）"]
 ```
 
-Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返回成功。配套项目 [Cartwheel](https://github.com/FufanLu/Cartwheel) 是无主、永远可写的 Dynamo 风格（AP）存储。M9 会用 YCSB 把两者放在一起跑分对比。理由见 [ADR 0003](docs/adr/0003-layered-cp-architecture.md)。
+Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返回成功。配套项目 [Cartwheel](https://github.com/FufanLu/Cartwheel) 是无主、永远可写的 Dynamo 风格（AP）存储。M9 用 YCSB 把两者放在一起做了对比（[第 11 章](docs/illustrated/11-ap-vs-cp.md)）。理由见 [ADR 0003](docs/adr/0003-layered-cp-architecture.md)。
 
 ## 进度
 
@@ -51,7 +51,7 @@ Stowage 有意选择 **CP**：写入必须被 Raft 多数派持久化后才返�
 | M6 | DynamoDB API、CDC、在线 schema 变更 | ✅ |
 | M7 | 安全、备份/PITR、配额、可观测性 | ✅ |
 | M8 | 运维控制台、Helm | ✅ |
-| M9 | 压测、混沌测试、兼容性验证 | |
+| M9 | 压测、混沌测试、兼容性验证 | ✅ |
 
 ### 存储引擎一览（M1）
 
@@ -145,6 +145,22 @@ helm install t deploy/helm/stowage && kubectl port-forward svc/t-stowage 9480 54
 - 用表格展示 `stowage_stat_statements`，看时间花在哪些语句上；
 - Helm chart（StatefulSet、headless Service、PodDisruptionBudget），CI 在 kind 上实测，包括一次滚动重启后数据仍在。
 
+### AP 对 CP、混沌测试与兼容性一览（M9）
+
+YCSB-A，zipfian(0.99)，32 个客户端，两边各三个节点，节点 2 被 kill 或冻结 10 秒（[第 11 章](docs/illustrated/11-ap-vs-cp.md)、[压测数据](docs/benchmarks.md#m9--ap-vs-cp-benchap-vs-cpsh)）：
+
+| | 正常 | 杀掉一个节点 | 冻结一个节点 | 错误 |
+|---|---:|---:|---:|---:|
+| Cartwheel（AP，不 fsync） | 15 353 ops/s | 17 668 | 10 293 | 11 次超时 |
+| Stowage，可串行化，`--unsafe-skip-fsync` | 12 221 ops/s | 9 896 | 9 353 | 0 |
+| Stowage，可串行化，fsync | 196 ops/s | 228 | 218 | 0 |
+
+- 持久性相同时，跑可串行化读-改-写的 CP 存储能达到 AP 存储的 80%；真正的代价是 `F_FULLFSYNC`，不是共识。
+- 第一次跑只有 26 ops/s、p99 49 秒。为此做了三处改动：日志 fsync 流水线化、加锁读、在 leaseholder 上排队等锁（[ADR 0011](docs/adr/0011-contention-and-group-commit.md)）。
+- 节点重启会引发 snapshot 风暴。修风暴时，仿真又揪出一个僵尸副本，它提交了一条与已提交日志冲突的条目。现在靠 tombstone、Raft 消息携带 generation 和副本 GC 杜绝这种情况。
+- `scripts/chaos.sh`：随机 kill、冻结节点的同时跑可串行化银行转账，钱数守恒，重放异常为 0。
+- Conveyor 和 Milkrun 的 Flyway 迁移原样通过，Java AWS SDK 客户端在 CI 里跑通 DynamoDB API（[兼容性](docs/compat.md)）。
+
 ## 快速开始
 
 ```bash
@@ -162,6 +178,7 @@ cargo run -p stowd -- --data-dir /tmp/stowage/n1
 ## 文档
 
 - [架构](docs/ARCHITECTURE.md)
+- [PRFAQ](docs/PRFAQ.md)：按“逆向工作法”写的发布新闻稿和问答，数字全部来自实测
 - [图解章节](docs/illustrated/README.md)：每章跟踪一个请求，数据全部来自真实运行
 - [架构决策记录（ADR）](docs/adr/README.md)
 - [基准测试](docs/benchmarks.md)

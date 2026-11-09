@@ -32,6 +32,306 @@ enum Cmd {
     /// Bank transfers and audits as transactions against a running cluster;
     /// checks that every audit sees the same total.
     Bank(BankArgs),
+    /// YCSB core workloads A/B/C, defined exactly as Cartwheel's wheel-bench
+    /// defines them, for the AP-vs-CP comparison (chapter 11).
+    Ycsb(YcsbArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Update {
+    /// GetForUpdate and Put in one serializable transaction: no update is
+    /// lost, and writers of a hot key queue on its lock.
+    Txn,
+    /// Get and Put in one serializable transaction (optimistic: a concurrent
+    /// commit to the key restarts it).
+    Occ,
+    /// A plain Get, then a plain Put (each linearizable, the pair not atomic).
+    Blind,
+}
+
+#[derive(Debug, clap::Args)]
+struct YcsbArgs {
+    #[arg(
+        long,
+        default_value = "1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003"
+    )]
+    peers: String,
+    /// A = 50% read / 50% update, B = 95 / 5, C = read only.
+    #[arg(long, default_value = "A")]
+    workload: String,
+    #[arg(long, default_value_t = 50_000)]
+    keys: u64,
+    /// Insert this many keys first (0: assume they are there).
+    #[arg(long, default_value_t = 0)]
+    load: u64,
+    #[arg(long, default_value_t = 100)]
+    value_size: usize,
+    /// Clients in flight (wheel-bench's --threads).
+    #[arg(long, default_value_t = 32)]
+    threads: usize,
+    #[arg(long, default_value_t = 30)]
+    duration: u64,
+    #[arg(long, value_enum, default_value_t = Update::Txn)]
+    update: Update,
+    /// Split the key space into this many ranges before loading.
+    #[arg(long, default_value_t = 1)]
+    presplit: u64,
+}
+
+/// Uniform in [0, 1) from 53 random bits.
+fn unit(rng: &mut Xoshiro256) -> f64 {
+    use stowage_common::env::Rng as _;
+    (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// wheel-bench's key for rank `r`, so both systems store the same keys.
+fn ycsb_key(rank: u64) -> Vec<u8> {
+    format!(
+        "user{:016x}",
+        (rank + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    )
+    .into_bytes()
+}
+
+/// Zipfian over [0, n) by an inverse-CDF table, theta 0.99 (YCSB's default),
+/// the same construction as wheel-bench.
+struct Zipf {
+    cdf: Vec<f64>,
+}
+
+impl Zipf {
+    fn new(n: u64, theta: f64) -> Self {
+        let sum: f64 = (1..=n).map(|i| 1.0 / (i as f64).powf(theta)).sum();
+        let mut acc = 0.0;
+        let cdf = (1..=n)
+            .map(|i| {
+                acc += 1.0 / (i as f64).powf(theta) / sum;
+                acc
+            })
+            .collect();
+        Self { cdf }
+    }
+
+    fn next(&self, rng: &mut Xoshiro256) -> u64 {
+        let u = unit(rng);
+        self.cdf.partition_point(|&c| c < u).min(self.cdf.len() - 1) as u64
+    }
+}
+
+#[derive(Default)]
+struct YcsbStats {
+    ops: std::sync::atomic::AtomicU64,
+    errors: std::sync::atomic::AtomicU64,
+    unavailable: std::sync::atomic::AtomicU64,
+    restarts: std::sync::atomic::AtomicU64,
+    hist: std::sync::Mutex<Option<Histogram<u64>>>,
+}
+
+async fn ycsb_bench(a: YcsbArgs) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Duration;
+    use stowage_kv::txn::{Isolation, Outcome, Step, TxnOp};
+    let client = Arc::new(stowage_node::KvClient::new(
+        stowage_node::parse_peers(&a.peers).map_err(anyhow::Error::msg)?,
+    ));
+    let value = vec![b'x'; a.value_size];
+    if a.presplit > 1 {
+        for i in 1..a.presplit {
+            client
+                .split(format!("user{:016x}", u64::MAX / a.presplit * i).as_bytes())
+                .await?;
+        }
+        println!(
+            "pre-split into {} ranges; waiting 5 s for leaders to spread",
+            a.presplit
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    if a.load > 0 {
+        let t = Instant::now();
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let failed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..a.threads {
+            let (client, next, failed, value, load) = (
+                client.clone(),
+                next.clone(),
+                failed.clone(),
+                value.clone(),
+                a.load,
+            );
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    if i >= load {
+                        return;
+                    }
+                    if client.put(&ycsb_key(i), &value).await.is_err() {
+                        failed.fetch_add(1, Relaxed);
+                    }
+                }
+            }));
+        }
+        for t in tasks {
+            t.await?;
+        }
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "load: {} keys in {secs:.1}s = {:.0} writes/s ({} failed)",
+            a.load,
+            a.load as f64 / secs,
+            failed.load(Relaxed)
+        );
+        if a.duration == 0 {
+            return Ok(());
+        }
+    }
+    let read_ratio = match a.workload.as_str() {
+        "C" => 1.0,
+        "B" => 0.95,
+        _ => 0.5,
+    };
+    let zipf = Arc::new(Zipf::new(a.keys, 0.99));
+    let stats: Vec<Arc<YcsbStats>> = (0..a.threads)
+        .map(|_| {
+            let s = YcsbStats::default();
+            *s.hist.lock().expect("hist") =
+                Some(Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).expect("hist"));
+            Arc::new(s)
+        })
+        .collect();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for (t, st) in stats.iter().enumerate() {
+        let (client, zipf, st, stop, value, update) = (
+            client.clone(),
+            zipf.clone(),
+            st.clone(),
+            stop.clone(),
+            value.clone(),
+            a.update,
+        );
+        tasks.push(tokio::spawn(async move {
+            let mut rng = Xoshiro256::seeded(1000 + t as u64);
+            while !stop.load(Relaxed) {
+                let key = ycsb_key(zipf.next(&mut rng));
+                let started = Instant::now();
+                let write = unit(&mut rng) >= read_ratio;
+                let ok = if !write {
+                    client.get(&key).await.map(drop)
+                } else if update == Update::Blind {
+                    match client.get(&key).await {
+                        Ok(_) => client.put(&key, &value).await,
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    let (k, v) = (key.clone(), value.clone());
+                    let program: stowage_kv::txn::Program = Box::new(move |_, done| match done {
+                        0 if update == Update::Txn => Step::Op(TxnOp::GetForUpdate(k.clone())),
+                        0 => Step::Op(TxnOp::Get(k.clone())),
+                        1 => Step::Op(TxnOp::Put(k.clone(), v.clone())),
+                        _ => Step::Commit,
+                    });
+                    match client.transact(Isolation::Serializable, program).await {
+                        Ok(Outcome::Committed { restarts, .. }) => {
+                            st.restarts.fetch_add(u64::from(restarts), Relaxed);
+                            Ok(())
+                        }
+                        Ok(other) => {
+                            if std::env::var("YCSB_DEBUG").is_ok() {
+                                eprintln!("outcome: {other:?}");
+                            }
+                            Err(stowage_node::ClientError::Timeout)
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                if let Some(h) = st.hist.lock().expect("hist").as_mut() {
+                    let _ = h.record(started.elapsed().as_nanos() as u64);
+                }
+                st.ops.fetch_add(1, Relaxed);
+                if let Err(e) = ok {
+                    if st.errors.load(Relaxed) < 2 && std::env::var("YCSB_DEBUG").is_ok() {
+                        eprintln!("error: {e:?} after {:?}", started.elapsed());
+                    }
+                    st.errors.fetch_add(1, Relaxed);
+                    if matches!(
+                        e,
+                        stowage_node::ClientError::Timeout
+                            | stowage_node::ClientError::Exhausted(..)
+                    ) {
+                        st.unavailable.fetch_add(1, Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+    println!(
+        "workload {} ({:.0}% reads, updates {:?}), {} clients, {} keys zipfian(0.99)",
+        a.workload,
+        read_ratio * 100.0,
+        a.update,
+        a.threads,
+        a.keys
+    );
+    println!(
+        "{:>4} {:>9} {:>7} {:>9} {:>9} {:>9}",
+        "t(s)", "ops/s", "errors", "p50", "p99", "p99.9"
+    );
+    let snapshot = |stats: &[Arc<YcsbStats>]| -> anyhow::Result<(u64, u64, Histogram<u64>)> {
+        let mut h = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)?;
+        let (mut ops, mut errors) = (0, 0);
+        for s in stats {
+            ops += s.ops.load(Relaxed);
+            errors += s.errors.load(Relaxed);
+            if let Some(x) = s.hist.lock().expect("hist").as_ref() {
+                h.add(x)?;
+            }
+        }
+        Ok((ops, errors, h))
+    };
+    let ms = |ns: u64| {
+        let m = ns as f64 / 1e6;
+        if m < 10.0 {
+            format!("{m:.2}ms")
+        } else {
+            format!("{m:.0}ms")
+        }
+    };
+    let (mut prev_ops, mut prev_err) = (0, 0);
+    let mut prev_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)?;
+    for sec in 1..=a.duration {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (ops, errors, h) = snapshot(&stats)?;
+        let mut interval = h.clone();
+        interval.subtract(&prev_hist)?;
+        println!(
+            "{sec:>4} {:>9} {:>7} {:>9} {:>9} {:>9}",
+            ops - prev_ops,
+            errors - prev_err,
+            ms(interval.value_at_quantile(0.5)),
+            ms(interval.value_at_quantile(0.99)),
+            ms(interval.value_at_quantile(0.999))
+        );
+        (prev_ops, prev_err, prev_hist) = (ops, errors, h);
+    }
+    stop.store(true, Relaxed);
+    for t in tasks {
+        t.await?;
+    }
+    let (ops, errors, h) = snapshot(&stats)?;
+    let unavailable: u64 = stats.iter().map(|s| s.unavailable.load(Relaxed)).sum();
+    let restarts: u64 = stats.iter().map(|s| s.restarts.load(Relaxed)).sum();
+    println!(
+        "total: {ops} ops in {}s = {:.0} ops/s, {errors} errors ({unavailable} unavailable/timeout), {restarts} transaction restarts, p50 {} p99 {} p99.9 {}",
+        a.duration,
+        ops as f64 / a.duration as f64,
+        ms(h.value_at_quantile(0.5)),
+        ms(h.value_at_quantile(0.99)),
+        ms(h.value_at_quantile(0.999))
+    );
+    Ok(())
 }
 
 #[derive(Debug, clap::Args)]
@@ -304,6 +604,10 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()?
             .block_on(bank_bench(a)),
+        Cmd::Ycsb(a) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(ycsb_bench(a)),
     }
 }
 

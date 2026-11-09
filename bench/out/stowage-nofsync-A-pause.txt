@@ -1,0 +1,35 @@
+workload A (50% reads, updates Txn), 32 clients, 50000 keys zipfian(0.99)
+t(s)     ops/s  errors       p50       p99     p99.9
+   1     11896       0    1.44ms      39ms     144ms
+   2     12920       0    1.40ms      36ms     107ms
+   3     12653       0    1.46ms      32ms     134ms
+   4     12336       0    1.46ms      40ms     130ms
+   5     12889       0    1.44ms      33ms     120ms
+   6     12278       0    1.42ms      31ms     131ms
+   7     12426       0    1.44ms      30ms     117ms
+   8     12498       0    1.48ms      36ms     103ms
+   9     12106       0    1.43ms      39ms     124ms
+  10     11921       0    1.44ms      39ms     125ms
+  11        20       0    0.59ms      51ms      51ms
+  12         0       0    0.00ms    0.00ms    0.00ms
+  13         0       0    0.00ms    0.00ms    0.00ms
+  14      9796       0    1.78ms      65ms    3028ms
+  15      8797       0    1.69ms      57ms     142ms
+  16     10020       0    1.78ms      50ms     126ms
+  17     11305       0    1.68ms      35ms     131ms
+  18     11272       0    1.65ms      36ms     114ms
+  19     11305       0    1.58ms      41ms     112ms
+  20     11258       0    1.67ms      36ms     134ms
+  21      7993       0    1.86ms      76ms     192ms
+  22      7744       0    2.00ms      71ms     241ms
+  23      8667       0    2.14ms      50ms     133ms
+  24      8279       0    1.99ms      47ms     181ms
+  25      8846       0    1.93ms      50ms     168ms
+  26      8097       0    2.07ms      53ms     210ms
+  27      7865       0    2.17ms      60ms     158ms
+  28      8960       0    2.12ms      46ms     128ms
+  29      8283       0    2.02ms      59ms     156ms
+  30      8133       0    1.97ms      65ms     157ms
+total: 280603 ops in 30s = 9353 ops/s, 0 errors (0 unavailable/timeout), 0 transaction restarts, p50 1.59ms p99 44ms p99.9 145ms
+## t=10s: SIGSTOP node 2
+## t=20s: SIGCONT node 2

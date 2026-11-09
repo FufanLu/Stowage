@@ -1,0 +1,35 @@
+workload A (50% reads, updates Txn), 32 clients, 50000 keys zipfian(0.99)
+t(s)     ops/s  errors       p50       p99     p99.9
+   1       356       0      77ms     274ms     509ms
+   2       303       0      73ms     527ms     880ms
+   3       328       0      75ms    1756ms    2223ms
+   4       211       0      69ms     499ms    1719ms
+   5       148       0      72ms    1451ms    2043ms
+   6       196       0      76ms    1758ms    2997ms
+   7       199       0      77ms    3324ms    4125ms
+   8       238       0      77ms    4559ms    5029ms
+   9       193       0      80ms    5742ms    5776ms
+  10       183       0      76ms    1658ms    7000ms
+  11       251       0      64ms    3821ms    7885ms
+  12       257       0      64ms    2938ms    6161ms
+  13       241       0      64ms    3196ms   10972ms
+  14       227       0      64ms    1431ms    2044ms
+  15       212       0      36ms     720ms    6845ms
+  16       259       0      64ms    3901ms    5444ms
+  17       306       0      61ms     720ms    5419ms
+  18       321       0      64ms     420ms   14621ms
+  19       274       0      64ms    1120ms    5121ms
+  20       244       0      65ms    3349ms    7776ms
+  21       252       0      64ms    2338ms   11870ms
+  22       248       0      64ms    5826ms   10863ms
+  23       235       0      68ms    1539ms    5935ms
+  24       252       0      49ms     992ms    3039ms
+  25       128       0      73ms     831ms    1107ms
+  26        85       0      76ms    4769ms    4769ms
+  27       120       0      72ms    4280ms    4773ms
+  28       154       0      80ms    6711ms   13028ms
+  29       202       0      74ms    3748ms    4727ms
+  30       180       0      79ms    5092ms    8313ms
+total: 6835 ops in 30s = 228 ops/s, 0 errors (0 unavailable/timeout), 154 transaction restarts, p50 64ms p99 3039ms p99.9 9328ms
+## t=10s: SIGKILL node 2
+## t=20s: node 2 restarted

@@ -192,3 +192,37 @@ A SQL statement on a three-node cluster, the gateway not being the leader
 Loading the chapter 06 dataset (1 255 rows in 4 multi-row `INSERT`s, plus two
 index entries' worth of writes per order) takes 32 s on macOS: one Raft write
 per row and per index entry, issued one at a time.
+
+## M9 — AP vs CP (`bench/ap-vs-cp.sh`)
+
+YCSB workload A (50 % reads, 50 % updates), 50 000 keys zipfian(0.99), 32 clients,
+100-byte values, 30 s per run. Three processes per system on the laptop. Stowage
+updates are `GetForUpdate` + `Put` in one serializable transaction; Cartwheel's are
+a quorum read and a quorum write with the read's causal context. Node 2 is
+SIGKILLed (or SIGSTOPped) at 10 s and restarted (or resumed) at 20 s. Per-second
+output: [`bench/out/`](../bench/out/). Walkthrough: [chapter 11](illustrated/11-ap-vs-cp.md).
+
+```bash
+CARTWHEEL=~/Cartwheel bench/ap-vs-cp.sh A 30
+```
+
+| system | healthy ops/s | p99 | kill ops/s | p99 | pause ops/s | p99 | p99.9 (pause) | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Cartwheel (AP, no fsync) | 15 353 | 10.0 ms | 17 668 | 8.7 ms | 10 293 | 10.6 ms | 508 ms | 11 timeouts |
+| Stowage, `--unsafe-skip-fsync` | 12 221 | 35 ms | 9 896 | 48 ms | 9 353 | 44 ms | 145 ms | 0 |
+| Stowage (CP, fsync) | 196 | 3.7 s | 228 | 3.0 s | 218 | 3.1 s | 8.6 s | 0 |
+| Stowage, blind `Get`+`Put`, fsync | 732 | 69 ms | | | | | | 0 |
+
+With the same durability (no fsync), the CP store with serializable transactions
+reaches 80 % of the AP store's throughput. With `F_FULLFSYNC` on two of three
+replicas per Raft write (about 11 ms each), it does 196 ops/s: four sequential
+writes per locked read-modify-write, on the hottest key one after another.
+
+### Chaos (`scripts/chaos.sh 60 4242`)
+
+Serializable bank transfers, 1 000 accounts, 16 clients, fsync on. Eight random
+SIGKILL/SIGSTOP faults in 60 s.
+
+| txn/s | transfers | audits | restarts | failed | p50 | p99 | money conserved | replay anomalies |
+|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| 54 | 2 922 | 322 | 59 | 0 | 188 ms | 3.2 s | yes (1 000 000) | 0 |

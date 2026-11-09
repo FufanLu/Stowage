@@ -1,0 +1,33 @@
+workload A (50% reads, updates Blind), 32 clients, 50000 keys zipfian(0.99)
+t(s)     ops/s  errors       p50       p99     p99.9
+   1       722       0      41ms      69ms      72ms
+   2       715       0      45ms      69ms      77ms
+   3       686       0      48ms      75ms      83ms
+   4       753       0      41ms      68ms      76ms
+   5       709       0      44ms      67ms      74ms
+   6       764       0      41ms      65ms      68ms
+   7       736       0      42ms      68ms      72ms
+   8       741       0      41ms      69ms      73ms
+   9       767       0      41ms      66ms      72ms
+  10       731       0      44ms      66ms      70ms
+  11       748       0      44ms      68ms      85ms
+  12       699       0      48ms      72ms      81ms
+  13       721       0      44ms      69ms      76ms
+  14       742       0      41ms      69ms      75ms
+  15       725       0      44ms      68ms      72ms
+  16       765       0      40ms      69ms      79ms
+  17       710       0      44ms      65ms      72ms
+  18       697       0      48ms      72ms      78ms
+  19       747       0      41ms      64ms      72ms
+  20       737       0      42ms      69ms      74ms
+  21       778       0      39ms      72ms      80ms
+  22       701       0      44ms      70ms      73ms
+  23       711       0      44ms      68ms      73ms
+  24       747       0      42ms      69ms      70ms
+  25       754       0      41ms      70ms      72ms
+  26       716       0      44ms      70ms      80ms
+  27       712       0      44ms      70ms      78ms
+  28       734       0      44ms      66ms      78ms
+  29       734       0      43ms      68ms      76ms
+  30       712       0      45ms      71ms      84ms
+total: 21946 ops in 30s = 732 ops/s, 0 errors (0 unavailable/timeout), 0 transaction restarts, p50 44ms p99 69ms p99.9 78ms

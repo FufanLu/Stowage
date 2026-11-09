@@ -1,0 +1,18 @@
+seed 4242, 60 s
+t=3s SIGKILL node 3, restart after 3s
+t=8s SIGSTOP node 2 for 5s
+t=16s SIGSTOP node 3 for 3s
+t=23s SIGSTOP node 1 for 3s
+t=29s SIGSTOP node 2 for 2s
+t=34s SIGSTOP node 3 for 5s
+t=43s SIGSTOP node 1 for 4s
+t=49s SIGSTOP node 3 for 3s
+t=52s nemesis stops
+funded 1000 accounts in 10.9 s
+replayed 2922 committed transfers: 0 read a state their predecessors did not leave
+
+ssi · 1000 accounts · 6 ranges · concurrency 16 · 60 s
+| txn/s | transfers | audits | restarts | failed | p50 ms | p99 ms | p99.9 ms |
+|------:|----------:|-------:|---------:|-------:|-------:|-------:|---------:|
+|    54 |      2922 |    322 |       59 |      0 | 187.56 | 3214.93 |  3405.77 |
+final audit: total 1000000 (expected 1000000), missing accounts in audits: 0

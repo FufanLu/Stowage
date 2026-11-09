@@ -19,4 +19,4 @@ Each chapter names the command that regenerates its data.
 | 08 | [A DynamoDB PutItem](08-a-dynamodb-putitem.md) | a conditional `PutItem` over HTTP, its keys, the changefeed window, the GSI entry, the stream record | M6 | ✅ |
 | 09 | [Online ADD INDEX](09-online-add-index.md) | write-only → backfill → public while three writers change the table; why SSI makes it safe | M6 | ✅ |
 | 10 | [Backup and PITR](10-backup-and-pitr.md) | a `DELETE` without `WHERE`, restored to the second before it into a fresh cluster; why changefeed windows make backups gap-free | M7 | ✅ |
-| 11 | AP vs CP | YCSB against Stowage and Cartwheel, healthy and partitioned | M9 | planned |
+| 11 | [AP vs CP](11-ap-vs-cp.md) | YCSB-A against Cartwheel and Stowage through a kill and a freeze; why fsync, not consensus, is the cost; the snapshot storm on rejoin and the zombie replica it exposed; bank transfers under chaos | M9 | ✅ |
