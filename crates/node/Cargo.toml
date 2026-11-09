@@ -10,10 +10,12 @@ publish.workspace = true
 [dependencies]
 stowage-common.workspace = true
 stowage-kv.workspace = true
+stowage-raft.workspace = true
 
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tempfile.workspace = true

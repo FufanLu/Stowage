@@ -73,6 +73,12 @@ pub struct Config {
     /// *while* writing them locally (thesis §10.2.1) without ever committing an
     /// entry that a majority has not persisted.
     pub async_durability: bool,
+    /// Ticks without any reply before a follower that was sent a snapshot is
+    /// considered stalled and sent another one. Much longer than the Append
+    /// stall timeout: a snapshot of a large range takes time to ship and
+    /// install, and an impatient leader resending it (generating each copy)
+    /// turns one lagging follower into a snapshot storm.
+    pub snapshot_retry_ticks: u32,
 }
 
 impl Config {
@@ -90,6 +96,7 @@ impl Config {
             seed: id,
             app_snapshots: false,
             async_durability: false,
+            snapshot_retry_ticks: 50,
         }
     }
 }
@@ -214,6 +221,9 @@ pub struct Raft<S: Storage> {
     snapshot_requests: BTreeSet<NodeId>,
     /// This node's log is durable up to here (only meaningful with `async_durability`).
     durable_index: Index,
+    /// May this node campaign? An application replica with no state machine
+    /// yet (waiting for a snapshot) votes but must not lead.
+    promotable: bool,
     /// Term or vote changed and must be persisted before any output is taken.
     hs_dirty: bool,
     stats: RaftStats,
@@ -274,6 +284,7 @@ impl<S: Storage> Raft<S> {
             store,
             snapshot_requests: BTreeSet::new(),
             durable_index: 0,
+            promotable: true,
             hs_dirty: false,
             stats: RaftStats::default(),
         };
@@ -338,6 +349,17 @@ impl<S: Storage> Raft<S> {
             .iter()
             .map(|(&id, p)| (id, p.matched, p.next))
             .collect()
+    }
+
+    /// Allow or forbid campaigning (see the `promotable` field). Forbidding it
+    /// also gives up leadership this node holds.
+    pub fn set_promotable(&mut self, promotable: bool) -> Result<()> {
+        self.promotable = promotable;
+        if !promotable && self.role != Role::Follower {
+            let term = self.term;
+            self.become_follower(term, None)?;
+        }
+        Ok(())
     }
 
     fn last_term(&self) -> Term {
@@ -497,7 +519,10 @@ impl<S: Storage> Raft<S> {
                 let ctx = self.pending_reads.back().map_or(0, |r| r.ctx);
                 self.broadcast_heartbeat(ctx);
             }
-        } else if self.election_elapsed >= self.randomized_timeout && self.is_voter() {
+        } else if self.election_elapsed >= self.randomized_timeout
+            && self.is_voter()
+            && self.promotable
+        {
             self.campaign(self.cfg.pre_vote, false)?;
         }
         Ok(())
@@ -623,6 +648,37 @@ impl<S: Storage> Raft<S> {
 
     /// The state machine has a snapshot covering everything up to `index`
     /// (`<= applied`): store it and drop the log prefix.
+    /// How far the log may be compacted without cutting off a follower that is
+    /// catching up: the applied index, lowered on a leader to the match index of
+    /// every recently active follower within `max_lag` entries of it. A
+    /// follower compacted past needs a snapshot; one that just installed a
+    /// snapshot and is streaming the entries after it would otherwise need
+    /// another, and another, while the leader keeps writing. A follower further
+    /// behind than `max_lag`, or silent, does not hold the log back.
+    pub fn compaction_floor(&self, max_lag: u64) -> Index {
+        let mut floor = self.applied;
+        if self.role == Role::Leader {
+            for (&id, p) in &self.progress {
+                // A follower receiving a snapshot will continue from its index,
+                // and may be too busy installing it to answer heartbeats (so
+                // not "recently active"): keep what follows the snapshot.
+                // Only a follower that is streaming entries holds the log: one
+                // stuck probing (rejecting) may have lost what it once matched
+                // (its replica was destroyed and recreated), and needs a
+                // snapshot anyway.
+                let (at, active) = match p.state {
+                    ReplState::Snapshot(i) if i > 0 => (i, true),
+                    ReplState::Replicate => (p.matched, p.recent_active),
+                    _ => (p.matched, false),
+                };
+                if id != self.cfg.id && active && self.applied.saturating_sub(at) <= max_lag {
+                    floor = floor.min(at);
+                }
+            }
+        }
+        floor
+    }
+
     pub fn compact(&mut self, index: Index, data: Vec<u8>) -> Result<()> {
         if index > self.applied || index <= self.store.snapshot_meta().index {
             return Ok(());
@@ -774,7 +830,7 @@ impl<S: Storage> Raft<S> {
             Body::HeartbeatResp { read_ctx, round } if self.role == Role::Leader => {
                 self.handle_heartbeat_resp(m.from, read_ctx, round)?;
             }
-            Body::TimeoutNow if self.is_voter() && self.role != Role::Leader => {
+            Body::TimeoutNow if self.is_voter() && self.promotable && self.role != Role::Leader => {
                 self.campaign(false, true)?;
             }
             _ => {}
@@ -1174,6 +1230,14 @@ impl<S: Storage> Raft<S> {
             if prev_index < pr.matched {
                 return Ok(()); // stale rejection
             }
+            if matches!(pr.state, ReplState::Snapshot(_)) {
+                // A rejection of an Append sent before the snapshot. Probing
+                // again would find the entries compacted and request another
+                // snapshot, then another for each rejection still in flight
+                // (a snapshot storm). The snapshot's acknowledgement moves the
+                // follower on; `snapshot_retry_ticks` covers a lost one.
+                return Ok(());
+            }
             self.stats.rejections += 1;
             let next = match hint {
                 Some(ConflictHint {
@@ -1191,6 +1255,22 @@ impl<S: Storage> Raft<S> {
             let Some(pr) = self.progress.get_mut(&from) else {
                 return Ok(());
             };
+            if let Some(ConflictHint {
+                term: None,
+                first_index,
+            }) = hint
+                && prev_index == pr.matched
+                && first_index <= pr.matched
+            {
+                // A probe exactly at the entry we counted as matched was
+                // rejected because the follower's log ends before it: its
+                // replica was destroyed and recreated empty (removed, then
+                // added back). Its old match index means nothing now; without
+                // resetting it we would probe at `matched` forever. (Requiring
+                // `prev_index == matched` ignores a reordered rejection of an
+                // older probe, sent before the follower caught up.)
+                pr.matched = first_index.saturating_sub(1);
+            }
             // Keep "already probed at the boundary": a rejection of that probe
             // means the follower really needs a snapshot.
             let tried = pr.tried_boundary;
@@ -1227,10 +1307,20 @@ impl<S: Storage> Raft<S> {
         let quiet = u64::from(2 * self.cfg.heartbeat_ticks);
         // Behind, and both the last reply and the last send are two heartbeat
         // intervals old. (Comparing send and reply ticks with each other is not
-        // enough: a reply and the next send often fall in the same tick.)
+        // enough: a reply and the next send often fall in the same tick.) A
+        // snapshot is different: the follower keeps answering heartbeats while
+        // it receives and installs one, so only the time since it was sent
+        // counts, and that is allowed to be long.
         let stalled = pr.matched < last
-            && self.now_tick >= pr.last_resp_tick + quiet
-            && self.now_tick >= pr.last_send_tick + quiet;
+            && match pr.state {
+                ReplState::Snapshot(_) => {
+                    self.now_tick >= pr.last_send_tick + u64::from(self.cfg.snapshot_retry_ticks)
+                }
+                _ => {
+                    self.now_tick >= pr.last_resp_tick + quiet
+                        && self.now_tick >= pr.last_send_tick + quiet
+                }
+            };
         if stalled {
             // An Append, a snapshot, or a reply to one was lost: find the
             // follower's position again (resending the snapshot if still needed).

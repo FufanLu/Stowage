@@ -343,6 +343,48 @@ pub fn put(
     }
 }
 
+/// A locking read: `txn` takes the intent on `key` at `ts`, keeping the newest
+/// committed value, and gets that value back. Holding the intent from the read
+/// on means nobody can commit a newer version before this transaction ends, so
+/// the read needs no refresh and the later write cannot be "too old": hot-key
+/// read-modify-write queues instead of restarting.
+pub fn lock(
+    engine: &BTree,
+    key: &[u8],
+    ts: Timestamp,
+    txn: &TxnMeta,
+    b: &mut WriteBatch,
+) -> Result<Response> {
+    match intent(engine, key)? {
+        Some(i) if i.txn.id != txn.id => return Ok(Response::Conflict(i.txn)),
+        Some(i) => {
+            return Ok(Response::Locked {
+                ts: i.txn.write_ts,
+                value: i.value,
+            });
+        }
+        None => {}
+    }
+    let newest = latest_version(engine, key, Timestamp::MAX)?;
+    if let Some((n, _)) = &newest
+        && *n >= ts
+    {
+        return Ok(Response::WriteTooOld(*n));
+    }
+    let value = newest.and_then(|(_, v)| v);
+    let mut meta = txn.clone();
+    meta.write_ts = ts;
+    b.put(
+        intent_key(key),
+        Intent {
+            txn: meta,
+            value: value.clone(),
+        }
+        .encode(),
+    );
+    Ok(Response::Locked { ts, value })
+}
+
 pub fn end_txn(
     engine: &BTree,
     txn: &TxnMeta,

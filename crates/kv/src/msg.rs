@@ -19,10 +19,17 @@ pub enum PeerMsg {
     /// A Raft message for one range's group, with the sender's HLC time. Every
     /// receiver folds `ts` into its clock, so a newly elected leader's clock is at
     /// least as far as any timestamp its quorum saw from the previous leader.
+    ///
+    /// `generation` is the sender's descriptor generation for the range. A
+    /// node that was removed from the range keeps a tombstone with the
+    /// generation that removed it, and ignores messages from older ones: a
+    /// replica created late by a split it applied long after the fact
+    /// (a zombie with a stale membership) cannot recruit it as a voter.
     Raft {
         range: RangeId,
         msg: Message,
         ts: Timestamp,
+        generation: u64,
     },
     /// Periodic gossip: every replica this store holds. Gives every node a
     /// routing table and the scheduler its view of the cluster.
@@ -46,9 +53,15 @@ impl PeerMsg {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W::new();
         match self {
-            PeerMsg::Raft { range, msg, ts } => {
+            PeerMsg::Raft {
+                range,
+                msg,
+                ts,
+                generation,
+            } => {
                 w.u8(1).u64(*range).bytes(&encode_message(msg));
                 put_ts(&mut w, *ts);
+                w.u64(*generation);
             }
             PeerMsg::Heartbeat { node, ranges } => {
                 w.u8(2).u64(*node).u32(ranges.len() as u32);
@@ -89,6 +102,7 @@ impl PeerMsg {
                     range,
                     msg,
                     ts: get_ts(&mut r)?,
+                    generation: r.u64()?,
                 }
             }
             2 => {
@@ -177,6 +191,12 @@ pub enum Request {
         value: Option<Vec<u8>>,
         txn: TxnMeta,
     },
+    /// A locking read (`SELECT … FOR UPDATE`): take the write intent on `key`
+    /// now, holding its current value, and return that value.
+    TxnLock {
+        key: Vec<u8>,
+        txn: TxnMeta,
+    },
     /// Routed by `txn.anchor`: commit at `commit_ts`, or abort.
     EndTxn {
         txn: TxnMeta,
@@ -246,6 +266,11 @@ pub enum Response {
     Conflict(TxnMeta),
     /// A newer committed version exists at this timestamp; write above it.
     WriteTooOld(Timestamp),
+    /// A locking read took the intent at `ts`; `value` is the key's value.
+    Locked {
+        ts: Timestamp,
+        value: Option<Vec<u8>>,
+    },
     /// The state of a transaction record (reply to EndTxn, Push, Heartbeat).
     Txn {
         status: TxnStatus,
@@ -326,6 +351,11 @@ impl Request {
             }
             Request::TxnPut { key, value, txn } => {
                 w.u8(11).bytes(key).opt_bytes(value.as_deref());
+                txn.encode(&mut w);
+                &mut w
+            }
+            Request::TxnLock { key, txn } => {
+                w.u8(18).bytes(key);
                 txn.encode(&mut w);
                 &mut w
             }
@@ -443,6 +473,10 @@ impl Request {
                 value: r.opt_bytes()?,
                 txn: TxnMeta::decode(&mut r)?,
             },
+            18 => Request::TxnLock {
+                key: r.bytes()?,
+                txn: TxnMeta::decode(&mut r)?,
+            },
             12 => Request::EndTxn {
                 txn: TxnMeta::decode(&mut r)?,
                 commit: r.u8()? == 1,
@@ -516,6 +550,7 @@ impl Request {
             | Request::Changes { start, .. } => Some(start),
             Request::TxnGet { key, .. }
             | Request::TxnPut { key, .. }
+            | Request::TxnLock { key, .. }
             | Request::Resolve { key, .. } => Some(key),
             Request::EndTxn { txn, .. } | Request::Heartbeat { txn } => Some(&txn.anchor),
             Request::Push { pushee, .. } => Some(&pushee.anchor),
@@ -568,6 +603,11 @@ impl Response {
             Response::WriteTooOld(ts) => {
                 w.u8(10);
                 put_ts(&mut w, *ts);
+            }
+            Response::Locked { ts, value } => {
+                w.u8(16);
+                put_ts(&mut w, *ts);
+                w.opt_bytes(value.as_deref());
             }
             Response::Txn {
                 status,
@@ -655,6 +695,10 @@ impl Response {
             8 => Response::Written(get_ts(&mut r)?),
             9 => Response::Conflict(TxnMeta::decode(&mut r)?),
             10 => Response::WriteTooOld(get_ts(&mut r)?),
+            16 => Response::Locked {
+                ts: get_ts(&mut r)?,
+                value: r.opt_bytes()?,
+            },
             11 => {
                 let status = match r.u8()? {
                     0 => TxnStatus::Pending,
@@ -799,6 +843,10 @@ mod tests {
                 value: None,
                 txn: txn.clone(),
             },
+            Request::TxnLock {
+                key: b"k".to_vec(),
+                txn: txn.clone(),
+            },
             Request::EndTxn {
                 txn: txn.clone(),
                 commit: true,
@@ -845,6 +893,11 @@ mod tests {
         for p in [
             Response::Written(ts),
             Response::WriteTooOld(ts),
+            Response::Locked {
+                ts,
+                value: Some(b"v".to_vec()),
+            },
+            Response::Locked { ts, value: None },
             Response::Conflict(txn.clone()),
             Response::Txn {
                 status: TxnStatus::Committed,
@@ -916,6 +969,7 @@ mod tests {
                     body: Body::TimeoutNow,
                 },
                 ts: Timestamp::new(5, 1),
+                generation: 9,
             },
             PeerMsg::Heartbeat {
                 node: 1,

@@ -2120,8 +2120,10 @@ dependencies = [
 name = "stowage-node"
 version = "0.1.0"
 dependencies = [
+ "socket2",
  "stowage-common",
  "stowage-kv",
+ "stowage-raft",
  "tempfile",
  "thiserror",
  "tokio",

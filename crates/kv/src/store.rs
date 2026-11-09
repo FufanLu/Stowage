@@ -12,7 +12,7 @@
 //!
 //! The same code runs inside the simulator and in `stowd`'s tokio driver.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -114,6 +114,15 @@ struct Replica {
     applied: u64,
     batch: Vec<Command>,
     waiting: BTreeMap<u64, Token>,
+    /// Leader only, not replicated: transactional writes and locking reads that
+    /// ran into another transaction's intent, parked per key in arrival order
+    /// until that intent is resolved (then proposed again, oldest first) or
+    /// their deadline passes (then answered `Conflict`, so the coordinator can
+    /// push). A lock wait queue: on a hot key, transactions take turns instead
+    /// of polling, and the turn order is arrival order.
+    lock_waits: BTreeMap<Vec<u8>, VecDeque<Parked>>,
+    /// Deadline (tick) of a re-proposed parked command, by proposal seq.
+    parked_deadline: BTreeMap<u64, u64>,
     /// Reads waiting for leadership confirmation (ReadIndex)...
     reads: BTreeMap<u64, PendingRead>,
     /// ...and then for every write proposed before them to apply.
@@ -130,7 +139,28 @@ struct Replica {
     /// waits for a snapshot; it owns no data and is ignored by overlap checks.
     uninitialized: bool,
     created_tick: u64,
+    /// Woken lock waiters were queued in `batch` while applying: propose them
+    /// at the end of this pump instead of waiting for the next flush.
+    wake_pending: bool,
 }
+
+#[derive(Debug)]
+struct Parked {
+    token: Token,
+    cmd: Command,
+    holder: crate::mvcc::TxnMeta,
+    deadline: u64,
+}
+
+/// Raft entries a leader keeps for a follower that is catching up (see
+/// `Raft::compaction_floor`).
+const COMPACT_MAX_LAG: u64 = 50_000;
+
+/// How long (ticks) a conflicting write waits in a lock queue before it is
+/// answered `Conflict` and its coordinator pushes the holder. It must stay well
+/// under any client's resend timeout (150 ms in the simulator): a resend parks
+/// a second copy, and the reply to the first is lost.
+const LOCK_WAIT_TICKS: u64 = 8;
 
 /// Peer messages and client responses, ready to send.
 type Outputs = (Vec<(NodeId, PeerMsg)>, Vec<(Token, Response)>);
@@ -163,6 +193,7 @@ pub mod divergence {
     #[derive(Default)]
     struct State {
         applied: BTreeMap<(RangeId, u64), (NodeId, u64)>,
+        whats: BTreeMap<(RangeId, u64), String>,
         events: VecDeque<String>,
     }
 
@@ -198,11 +229,12 @@ pub mod divergence {
             what.hash(&mut h);
             let fp = h.finish();
             let (first, prev) = *st.applied.entry((range, index)).or_insert((node, fp));
+            st.whats.entry((range, index)).or_insert_with(|| what.to_string());
             if prev != fp {
                 for e in &st.events {
                     eprintln!("  event: {e}");
                 }
-                panic!("replica divergence: n{node} applied range {range} index {index} differently from n{first}:\n{what}");
+                panic!("replica divergence: n{node} applied range {range} index {index} differently from n{first}:\n{what}\nFIRST: {}", st.whats[&(range, index)]);
             }
         });
     }
@@ -336,6 +368,15 @@ impl Store {
             })
             .collect::<Result<_>>()?;
         for d in descs {
+            if store.tombstone(d.id)? > d.generation {
+                // The right half of a late split we were already removed from;
+                // a crash came between writing and deleting its descriptor.
+                let mut c = WriteBatch::new();
+                c.delete(keys::desc(d.id));
+                c.delete(keys::applied(d.id));
+                store.engine.write(&c, false).map_err(storage_err)?;
+                continue;
+            }
             event(|| format!("n{} reopens {}", store.cfg.node, d));
             store.open_replica(d, false)?;
         }
@@ -409,7 +450,10 @@ impl Store {
                 raft,
                 applied,
                 batch: Vec::new(),
+                wake_pending: false,
                 waiting: BTreeMap::new(),
+                lock_waits: BTreeMap::new(),
+                parked_deadline: BTreeMap::new(),
                 reads: BTreeMap::new(),
                 confirmed: Vec::new(),
                 next_read: 1,
@@ -451,7 +495,10 @@ impl Store {
                 raft,
                 applied: 0,
                 batch: Vec::new(),
+                wake_pending: false,
                 waiting: BTreeMap::new(),
+                lock_waits: BTreeMap::new(),
+                parked_deadline: BTreeMap::new(),
                 reads: BTreeMap::new(),
                 confirmed: Vec::new(),
                 next_read: 1,
@@ -638,11 +685,33 @@ impl Store {
     pub fn tick(&mut self) -> Result<()> {
         self.ticks += 1;
         for (&id, r) in &mut self.replicas {
+            // An uninitialized replica has no state machine: it may vote, but
+            // must never campaign. A replica reopened from a Raft log whose
+            // descriptor a crash lost could otherwise win on the strength of
+            // that log, then lead a range it can neither apply nor serve while
+            // its heartbeats keep everyone else from electing a real leader.
+            r.raft
+                .set_promotable(!r.uninitialized)
+                .map_err(storage_err)?;
             r.raft.tick().map_err(storage_err)?;
             self.dirty.insert(id);
         }
         let ttl = 2 * self.cfg.store_timeout_ticks;
+        let ticks = self.ticks;
         for r in self.replicas.values_mut() {
+            for q in r.lock_waits.values_mut() {
+                // Re-parked waiters keep their first deadline, so a queue is not
+                // sorted by deadline: check every entry.
+                let (expired, kept): (VecDeque<Parked>, VecDeque<Parked>) = std::mem::take(q)
+                    .into_iter()
+                    .partition(|p| p.deadline <= ticks);
+                *q = kept;
+                for p in expired {
+                    self.client_out
+                        .push((p.token, Response::Conflict(p.holder)));
+                }
+            }
+            r.lock_waits.retain(|_, q| !q.is_empty());
             // Nobody ever sent it a snapshot. Only reclaim it if it never voted:
             // forgetting a vote could let this node vote twice in one term.
             let pristine = r.raft.storage().hard_state().vote.is_none();
@@ -661,9 +730,14 @@ impl Store {
 
     pub fn handle_peer(&mut self, from: NodeId, msg: PeerMsg) -> Result<()> {
         match msg {
-            PeerMsg::Raft { range, msg, ts } => {
+            PeerMsg::Raft {
+                range,
+                msg,
+                ts,
+                generation,
+            } => {
                 let _ = self.hlc.update(ts);
-                self.raft_message(from, range, msg)?;
+                self.raft_message(from, range, msg, generation)?;
             }
             PeerMsg::Heartbeat { node, ranges } => {
                 self.routing.store_seen(node, self.ticks);
@@ -701,13 +775,48 @@ impl Store {
                 {
                     r.destroy = true;
                     self.dirty.insert(range);
+                    self.set_tombstone(range, generation)?;
                 }
             }
         }
         self.pump()
     }
 
-    fn raft_message(&mut self, _from: NodeId, range: RangeId, msg: Message) -> Result<()> {
+    fn tombstone(&self, range: RangeId) -> Result<u64> {
+        Ok(self
+            .engine
+            .get(&keys::tombstone(range))
+            .map_err(storage_err)?
+            .map_or(0, |v| {
+                u64::from_le_bytes(v.as_slice().try_into().unwrap_or([0; 8]))
+            }))
+    }
+
+    fn set_tombstone(&mut self, range: RangeId, generation: u64) -> Result<()> {
+        if generation > self.tombstone(range)? {
+            let mut b = WriteBatch::new();
+            b.put(keys::tombstone(range), generation.to_le_bytes().to_vec());
+            self.engine.write(&b, false).map_err(storage_err)?;
+        }
+        Ok(())
+    }
+
+    fn raft_message(
+        &mut self,
+        _from: NodeId,
+        range: RangeId,
+        msg: Message,
+        generation: u64,
+    ) -> Result<()> {
+        // We were removed from this range at a later generation than the
+        // sender knows: it is a stale replica (for example one a late split
+        // just created with the membership of long ago). Neither vote for it
+        // nor accept its entries. An initialized replica of ours has a
+        // current descriptor and Raft's own term checks; a placeholder does not.
+        let ours_initialized = self.replicas.get(&range).is_some_and(|r| !r.uninitialized);
+        if !ours_initialized && generation < self.tombstone(range)? {
+            return Ok(());
+        }
         if let Body::InstallSnapshot { snapshot } = &msg.body {
             // Never let a snapshot land on top of a span another local replica owns
             // (we are behind on a split or merge there; the leader will retry).
@@ -931,6 +1040,13 @@ impl Store {
                     },
                 );
             }
+            Request::TxnLock { key, txn } => {
+                let _ = self.hlc.update(txn.write_ts);
+                let ts = txn.write_ts.max(r.tscache.max_read(&key).next());
+                let _ = self.hlc.update(ts);
+                let pid = self.alloc_pid();
+                self.push_command(id, token, Command::Lock { pid, key, ts, txn });
+            }
             Request::EndTxn {
                 txn,
                 commit,
@@ -1108,6 +1224,9 @@ impl Store {
                 }
             }
         }
+        if std::mem::take(&mut r.wake_pending) && !r.batch.is_empty() {
+            propose_batch(r, &mut self.stats, &mut self.client_out);
+        }
         // A new leader does not know which reads its predecessor served. It does
         // know its clock is past all of them: the old leader confirmed each read
         // with a quorum, our votes came from a quorum, and every Raft message
@@ -1158,6 +1277,20 @@ impl Store {
                     .push((t, Response::Error(KvError::Ambiguous)));
             }
         }
+        if !r.raft.is_leader() && !r.lock_waits.is_empty() {
+            // Parked requests did not change anything: retrying is safe.
+            let leader = r.raft.leader();
+            for p in std::mem::take(&mut r.lock_waits).into_values().flatten() {
+                self.client_out.push((
+                    p.token,
+                    Response::Error(KvError::NotLeader {
+                        range: r.desc.id,
+                        leader,
+                    }),
+                ));
+            }
+            r.parked_deadline.clear();
+        }
         if r.since_compact >= self.cfg.compact_every
             && !r.uninitialized
             && r.raft.applied() > r.raft.storage().snapshot_meta().index
@@ -1193,6 +1326,7 @@ impl Store {
                     range: r.desc.id,
                     msg: m,
                     ts: self.hlc.now(),
+                    generation: r.desc.generation,
                 },
             ));
         }
@@ -1310,7 +1444,12 @@ impl Store {
         let mut b = WriteBatch::new();
         b.put(keys::applied(id), e.index.to_le_bytes().to_vec());
         let mut reply: Option<(u64, Response)> = None;
+        // A conflicting command that may wait in a lock queue, and a key whose
+        // lock queue may move on.
+        let mut parkable: Option<(Vec<u8>, Command)> = None;
+        let mut wake: Option<Vec<u8>> = None;
         let mut new_range: Option<RangeDescriptor> = None;
+        let mut stale_right: Option<RangeId> = None;
         match &e.kind {
             EntryKind::Noop => {}
             EntryKind::Config(m) => {
@@ -1334,16 +1473,24 @@ impl Store {
                         r.destroy = true;
                     }
                 }
+                // A later configuration in the same batch of committed entries
+                // can add us back before the pending destroy runs.
+                if m.all().contains(&self.cfg.node) {
+                    r.destroy = false;
+                }
             }
             EntryKind::Normal(data) => match Command::decode(data)? {
                 cmd @ (Command::Put { .. }
                 | Command::EndTxn { .. }
                 | Command::Resolve { .. }
                 | Command::Push { .. }
-                | Command::Heartbeat { .. }) => {
+                | Command::Heartbeat { .. }
+                | Command::Lock { .. }) => {
                     let pid = cmd.pid();
                     let routed: &[u8] = match &cmd {
-                        Command::Put { key, .. } | Command::Resolve { key, .. } => key,
+                        Command::Put { key, .. }
+                        | Command::Resolve { key, .. }
+                        | Command::Lock { key, .. } => key,
                         Command::EndTxn { txn, .. } | Command::Heartbeat { txn, .. } => &txn.anchor,
                         Command::Push { pushee, .. } => &pushee.anchor,
                         Command::Split { .. } => &[],
@@ -1408,6 +1555,9 @@ impl Store {
                             Command::Heartbeat { txn, now_wall, .. } => {
                                 eval::heartbeat(&self.engine, txn, *now_wall, &mut b)?
                             }
+                            Command::Lock { key, ts, txn, .. } => {
+                                eval::lock(&self.engine, key, *ts, txn, &mut b)?
+                            }
                             Command::Split { .. } => Response::Done,
                         };
                         // Non-transactional writes answer like before.
@@ -1418,6 +1568,16 @@ impl Store {
                             (_, resp) => resp,
                         }
                     };
+                    match &cmd {
+                        Command::Lock { key, .. }
+                        | Command::Put {
+                            key, txn: Some(_), ..
+                        } if matches!(resp, Response::Conflict(_)) => {
+                            parkable = Some((key.clone(), cmd.clone()));
+                        }
+                        Command::Resolve { key, .. } => wake = Some(key.clone()),
+                        _ => {}
+                    }
                     reply = (pid.node == self.cfg.node).then_some((pid.seq, resp));
                 }
                 Command::Split {
@@ -1430,6 +1590,11 @@ impl Store {
                         && r.desc.contains(&key)
                         && key != r.desc.start
                     {
+                        // Applying this split late: the right half has since
+                        // removed us (a later generation tombstoned it here).
+                        // Shrink the left half, but do not resurrect the right
+                        // one with the membership of the past.
+                        let removed_from_right = self.tombstone(new_id)? > generation + 1;
                         let right = RangeDescriptor {
                             id: new_id,
                             start: key.clone(),
@@ -1440,15 +1605,23 @@ impl Store {
                         r.desc.end = key;
                         r.desc.generation = generation + 1;
                         b.put(keys::desc(id), r.desc.to_bytes());
+                        // Written either way, so every replica applies this
+                        // entry identically; a removed right half's keys are
+                        // deleted again right after (and skipped on reopen).
                         b.put(keys::desc(new_id), right.to_bytes());
                         b.put(keys::applied(new_id), INIT_INDEX.to_le_bytes().to_vec());
+                        if removed_from_right {
+                            stale_right = Some(new_id);
+                        }
                         event(|| {
                             format!(
                                 "n{} splits range {id} at index {} off {new_id}",
                                 self.cfg.node, e.index
                             )
                         });
-                        new_range = Some(right);
+                        if !removed_from_right {
+                            new_range = Some(right);
+                        }
                         self.stats.splits += 1;
                     }
                     reply = (pid.node == self.cfg.node).then_some((pid.seq, Response::Done));
@@ -1473,6 +1646,18 @@ impl Store {
         self.engine
             .write(&b, new_range.is_some())
             .map_err(storage_err)?;
+        if let Some(gone) = stale_right {
+            event(|| {
+                format!(
+                    "n{} skips the removed right half {gone} of a late split",
+                    self.cfg.node
+                )
+            });
+            let mut c = WriteBatch::new();
+            c.delete(keys::desc(gone));
+            c.delete(keys::applied(gone));
+            self.engine.write(&c, false).map_err(storage_err)?;
+        }
         r.applied = e.index;
         if let Some(right) = new_range {
             let was_leader = r.raft.is_leader();
@@ -1512,10 +1697,70 @@ impl Store {
                 }
             }
         }
-        if let Some((seq, resp)) = reply
-            && let Some(t) = r.waiting.remove(&seq)
+        if let Some((seq, Response::Conflict(holder))) = &reply
+            && let Some((key, cmd)) = parkable
+            && r.raft.is_leader()
         {
-            self.client_out.push((t, resp));
+            let deadline = r
+                .parked_deadline
+                .remove(seq)
+                .unwrap_or(self.ticks + LOCK_WAIT_TICKS);
+            if self.ticks < deadline
+                && let Some(token) = r.waiting.remove(seq)
+            {
+                r.lock_waits.entry(key).or_default().push_back(Parked {
+                    token,
+                    cmd,
+                    holder: holder.clone(),
+                    deadline,
+                });
+                reply = None;
+            }
+        }
+        if let Some((seq, resp)) = reply {
+            r.parked_deadline.remove(&seq);
+            if let Some(t) = r.waiting.remove(&seq) {
+                self.client_out.push((t, resp));
+            }
+        }
+        if let Some(key) = wake
+            && let Some(queue) = r.lock_waits.remove(&key)
+        {
+            // Propose every waiter again, in arrival order: the first takes the
+            // lock, the others conflict with it and park again, in order.
+            let read_floor = r.tscache.max_read(&key).next();
+            for p in queue {
+                let pid = self.alloc_pid();
+                let cmd = match p.cmd {
+                    Command::Lock { key, ts, txn, .. } => Command::Lock {
+                        pid,
+                        key,
+                        ts: ts.max(read_floor),
+                        txn,
+                    },
+                    Command::Put {
+                        key,
+                        value,
+                        ts,
+                        txn,
+                        ..
+                    } => Command::Put {
+                        pid,
+                        key,
+                        value,
+                        ts: ts.max(read_floor),
+                        txn,
+                    },
+                    other => other,
+                };
+                if let Command::Lock { ts, .. } | Command::Put { ts, .. } = &cmd {
+                    let _ = self.hlc.update(*ts);
+                }
+                r.parked_deadline.insert(pid.seq, p.deadline);
+                r.waiting.insert(pid.seq, p.token);
+                r.batch.push(cmd);
+            }
+            r.wake_pending = true;
         }
         Ok(())
     }
@@ -1568,7 +1813,7 @@ impl Store {
         // the log entries that produced it are discarded. The Raft snapshot itself
         // carries no data: lagging followers get one generated on demand.
         self.engine.sync().map_err(storage_err)?;
-        let index = r.raft.applied();
+        let index = r.raft.compaction_floor(COMPACT_MAX_LAG);
         r.raft.compact(index, Vec::new()).map_err(storage_err)
     }
 
@@ -1607,6 +1852,18 @@ impl Store {
         });
         let mut b = WriteBatch::new();
         if !r.uninitialized {
+            // Removed from the range: remember the generation that did it. If
+            // we applied our own removal, our descriptor is that generation;
+            // otherwise (a Gc told us) it is at least the next one.
+            let removed_at = if r.desc.replicas.contains(&self.cfg.node) {
+                r.desc.generation + 1
+            } else {
+                r.desc.generation
+            }
+            .max(self.tombstone(id)?);
+            b.put(keys::tombstone(id), removed_at.to_le_bytes().to_vec());
+        }
+        if !r.uninitialized {
             let others_cover = self
                 .replicas
                 .values()
@@ -1623,9 +1880,10 @@ impl Store {
         for chunk in ops.chunks(256) {
             let mut c = WriteBatch::new();
             for op in chunk {
-                if let stowage_storage::Op::Delete { key } = op {
-                    c.delete(key.clone());
-                }
+                match op {
+                    stowage_storage::Op::Delete { key } => c.delete(key.clone()),
+                    stowage_storage::Op::Put { key, value } => c.put(key.clone(), value.clone()),
+                };
             }
             self.engine.write(&c, false).map_err(storage_err)?;
         }
@@ -1645,6 +1903,34 @@ impl Store {
     // ---- gossip and scheduling ------------------------------------------------------------
 
     fn heartbeat(&mut self) {
+        // Replica GC: gossip knows a newer generation of a range that no longer
+        // includes us, so our replica is a leftover. Typically the right half
+        // of a split we applied long after the range moved on: nobody will
+        // ever contact it again, and its stale span would block every snapshot
+        // for the ranges now covering it. Destroy it and remember why.
+        let me = self.cfg.node;
+        let stale: Vec<(RangeId, u64)> = self
+            .replicas
+            .iter()
+            .filter(|(_, r)| !r.uninitialized && !r.destroy && !r.raft.is_leader())
+            .filter_map(|(&id, r)| {
+                let newer = self.routing.get(id)?;
+                (newer.desc.generation > r.desc.generation && !newer.desc.replicas.contains(&me))
+                    .then_some((id, newer.desc.generation))
+            })
+            .collect();
+        for (id, generation) in stale {
+            event(|| {
+                format!("n{me} collects stale replica {id} (removed at generation {generation})")
+            });
+            if let Some(r) = self.replicas.get_mut(&id) {
+                r.destroy = true;
+            }
+            self.dirty.insert(id);
+            if let Err(e) = self.set_tombstone(id, generation) {
+                tracing::warn!(error = %e, range = id, "cannot write tombstone");
+            }
+        }
         let infos: Vec<RangeInfo> = self
             .replicas
             .values()

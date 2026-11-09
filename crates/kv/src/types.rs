@@ -154,6 +154,14 @@ pub enum Command {
         ts: Timestamp,
         txn: Option<TxnMeta>,
     },
+    /// A locking read for `txn`: lay down an intent holding the newest
+    /// committed value (unchanged) at `ts` and return that value.
+    Lock {
+        pid: ProposalId,
+        key: Vec<u8>,
+        ts: Timestamp,
+        txn: TxnMeta,
+    },
     /// Commit (at `commit_ts`) or abort a transaction: update its record.
     EndTxn {
         pid: ProposalId,
@@ -274,6 +282,11 @@ impl Command {
                 txn.encode(&mut w);
                 w.u64(*now_wall);
             }
+            Command::Lock { key, ts, txn, .. } => {
+                w.u8(7).u64(pid.node).u64(pid.seq).bytes(key);
+                put_ts(&mut w, *ts);
+                txn.encode(&mut w);
+            }
             Command::Split {
                 pid,
                 key,
@@ -363,6 +376,12 @@ impl Command {
                     now_wall: r.u64()?,
                 }
             }
+            7 => Command::Lock {
+                pid,
+                key: r.bytes()?,
+                ts: get_ts(&mut r)?,
+                txn: TxnMeta::decode(&mut r)?,
+            },
             2 => Command::Split {
                 pid,
                 key: r.bytes()?,
@@ -382,6 +401,7 @@ impl Command {
             | Command::Resolve { pid, .. }
             | Command::Push { pid, .. }
             | Command::Heartbeat { pid, .. }
+            | Command::Lock { pid, .. }
             | Command::Split { pid, .. } => *pid,
         }
     }
@@ -424,6 +444,7 @@ impl SnapshotData {
 /// ```text
 ///  'l' ‖ "desc"    ‖ range_id (BE)     a local replica's descriptor
 ///  'l' ‖ "applied" ‖ range_id (BE)     its applied Raft index
+///  'l' ‖ "tomb"    ‖ range_id (BE)     generation that removed this node (u64 LE)
 ///  'l' ‖ "rangeseq"                    this node's range-id allocator
 ///  'l' ‖ "incarnation"                 bumped at every open; prefixes proposal ids
 /// ```
@@ -439,6 +460,12 @@ pub mod keys {
     }
     pub fn applied(id: u64) -> Vec<u8> {
         local("applied", id)
+    }
+    /// Written when a replica that was a member of the range is destroyed: the
+    /// generation that removed this node. Raft messages from older
+    /// generations are ignored (see `PeerMsg::Raft`).
+    pub fn tombstone(id: u64) -> Vec<u8> {
+        local("tomb", id)
     }
     pub fn desc_prefix() -> Vec<u8> {
         b"ldesc".to_vec()
@@ -490,6 +517,19 @@ mod tests {
                     start_wall: 3,
                     priority: 5,
                 }),
+            },
+            Command::Lock {
+                pid,
+                key: b"k".to_vec(),
+                ts: Timestamp::new(9, 2),
+                txn: TxnMeta {
+                    id: 8,
+                    anchor: b"k".to_vec(),
+                    epoch: 1,
+                    write_ts: Timestamp::new(9, 2),
+                    start_wall: 4,
+                    priority: 6,
+                },
             },
             Command::Push {
                 pid,

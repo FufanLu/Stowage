@@ -144,7 +144,7 @@ fn dump_history(sim: &Simulation<Node>, d: &TxnDriver) {
 const ACCOUNTS: u64 = 5;
 const START: u64 = 100;
 
-fn bank(seed: u64, iso: Isolation, interactive: bool) -> (usize, usize) {
+fn bank(seed: u64, iso: Isolation, interactive: bool, locking: bool) -> (usize, usize) {
     let calm = std::env::var("STOWAGE_TXN_CALM").is_ok();
     let net = NetConfig {
         drop_prob: if calm { 0.0 } else { 0.02 },
@@ -222,6 +222,8 @@ fn bank(seed: u64, iso: Isolation, interactive: bool) -> (usize, usize) {
                     "transfer",
                     iso,
                     Box::new(move |reads, done| match done {
+                        0 if locking => Step::Op(TxnOp::GetForUpdate(key(a))),
+                        1 if locking => Step::Op(TxnOp::GetForUpdate(key(b))),
                         0 => Step::Op(TxnOp::Get(key(a))),
                         1 => Step::Op(TxnOp::Get(key(b))),
                         2 if dec(&reads[0]) < amt => Step::Commit, // insufficient funds: read-only
@@ -291,7 +293,7 @@ fn bank(seed: u64, iso: Isolation, interactive: bool) -> (usize, usize) {
 #[test]
 fn bank_conserves_money_under_ssi() {
     for_each_seed(&[1, 2], |seed| {
-        let (audits, transfers) = bank(seed, Isolation::Serializable, false);
+        let (audits, transfers) = bank(seed, Isolation::Serializable, false, false);
         assert!(
             audits > 20 && transfers > 50,
             "seed {seed}: {audits} audits, {transfers} transfers"
@@ -305,7 +307,7 @@ fn bank_conserves_money_under_ssi() {
 #[test]
 fn bank_conserves_money_interactive() {
     for_each_seed(&[5, 6], |seed| {
-        let (audits, transfers) = bank(seed, Isolation::Serializable, true);
+        let (audits, transfers) = bank(seed, Isolation::Serializable, true, false);
         assert!(
             audits > 10 && transfers > 30,
             "seed {seed}: {audits} audits, {transfers} transfers"
@@ -313,10 +315,124 @@ fn bank_conserves_money_interactive() {
     });
 }
 
+/// Transfers read both accounts with `GetForUpdate` (`SELECT … FOR UPDATE`):
+/// the same invariants hold under SSI, and under SI the locks also rule out the
+/// lost update that first-committer-wins would otherwise have to catch.
+#[test]
+fn bank_conserves_money_with_locking_reads() {
+    for_each_seed(&[7, 8], |seed| {
+        for iso in [Isolation::Serializable, Isolation::Snapshot] {
+            let (audits, transfers) = bank(seed, iso, false, true);
+            assert!(
+                audits > 20 && transfers > 50,
+                "seed {seed} {iso:?}: {audits} audits, {transfers} transfers"
+            );
+        }
+    });
+}
+
+/// Twelve clients increment one counter. Every committed increment must be in
+/// the final value (no lost update) with optimistic reads and with locking
+/// reads alike. The locking version must commit all 120 and should need far
+/// fewer restarts, because a writer waits for the lock instead of reading a
+/// value that is about to be overwritten; optimistic ones may give up.
+#[test]
+fn hot_counter_locking_reads_restart_less() {
+    let run_counter = |seed: u64, locking: bool| -> (u64, u64) {
+        let mut sim = cluster(
+            seed,
+            NetConfig {
+                drop_prob: 0.0,
+                ..NetConfig::default()
+            },
+        );
+        let mut rng = Xoshiro256::seeded(seed ^ 0xC0);
+        let mut d = TxnDriver::new(vec![1, 2, 3]);
+        run(&mut sim, &mut d, &mut rng, SEC);
+        let mut started = 0;
+        while started < 120 || d.running() > 0 {
+            while started < 120 && d.running() < 12 {
+                started += 1;
+                d.start(
+                    &sim,
+                    &mut rng,
+                    "inc",
+                    Isolation::Serializable,
+                    Box::new(move |reads, done| match done {
+                        0 if locking => Step::Op(TxnOp::GetForUpdate(b"counter".to_vec())),
+                        0 => Step::Op(TxnOp::Get(b"counter".to_vec())),
+                        1 => Step::Op(TxnOp::Put(b"counter".to_vec(), enc(dec(&reads[0]) + 1))),
+                        _ => Step::Commit,
+                    }),
+                );
+            }
+            run(&mut sim, &mut d, &mut rng, 10 * MS);
+            assert!(
+                sim.now() < 600 * SEC,
+                "seed {seed}: the counter never finished"
+            );
+        }
+        settle(&mut sim, &mut d, &mut rng);
+        let (mut committed, mut restarts, mut restarts_given_up) = (0, 0, 0);
+        for f in &d.finished {
+            match &f.outcome {
+                Outcome::Committed { restarts: r, .. } => {
+                    committed += 1;
+                    restarts += u64::from(*r);
+                }
+                // Optimistic increments of one hot key may exhaust their
+                // restarts; that is the point of the comparison.
+                Outcome::GaveUp { restarts } if locking => {
+                    panic!("seed {seed} locking={locking}: gave up after {restarts} restarts")
+                }
+                Outcome::GaveUp { restarts } => restarts_given_up += u64::from(*restarts),
+                _ => {}
+            }
+        }
+        restarts += restarts_given_up;
+        d.start(
+            &sim,
+            &mut rng,
+            "read",
+            Isolation::Serializable,
+            Box::new(|_, done| match done {
+                0 => Step::Op(TxnOp::Get(b"counter".to_vec())),
+                _ => Step::Commit,
+            }),
+        );
+        settle(&mut sim, &mut d, &mut rng);
+        let Some(Outcome::Committed { reads, .. }) = d.finished.last().map(|f| &f.outcome) else {
+            panic!("seed {seed}: final read failed")
+        };
+        assert_eq!(
+            dec(&reads[0]),
+            committed,
+            "seed {seed} locking={locking}: lost update"
+        );
+        (committed, restarts)
+    };
+    for_each_seed(&[11], |seed| {
+        let (n_occ, r_occ) = run_counter(seed, false);
+        let (n_lock, r_lock) = run_counter(seed, true);
+        println!(
+            "optimistic: {n_occ} increments, {r_occ} restarts; locking: {n_lock} increments, {r_lock} restarts"
+        );
+        assert_eq!(
+            n_lock, 120,
+            "seed {seed}: a locking increment did not commit"
+        );
+        assert!(n_occ <= 120);
+        assert!(
+            r_lock * 2 < r_occ.max(1),
+            "seed {seed}: locking reads restarted {r_lock} times, optimistic {r_occ}"
+        );
+    });
+}
+
 #[test]
 fn bank_conserves_money_under_si() {
     for_each_seed(&[3, 4], |seed| {
-        let (audits, transfers) = bank(seed, Isolation::Snapshot, false);
+        let (audits, transfers) = bank(seed, Isolation::Snapshot, false, false);
         assert!(
             audits > 20 && transfers > 50,
             "seed {seed}: {audits} audits, {transfers} transfers"

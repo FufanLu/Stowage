@@ -80,13 +80,27 @@ impl Rng for Xoshiro256 {
 #[derive(Debug, Clone)]
 pub struct OsDisk {
     root: PathBuf,
+    skip_fsync: bool,
 }
 
 impl OsDisk {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            skip_fsync: false,
+        })
+    }
+
+    /// **Unsafe, for benchmarks only**: every fsync becomes a no-op, so an
+    /// acknowledged write survives a process crash (the OS has it) but not a
+    /// power loss of a majority. This is the durability that replication alone
+    /// gives, which is what Dynamo-style stores such as Cartwheel run with by
+    /// default; it lets the two be compared like for like.
+    pub fn skip_fsync(mut self, skip: bool) -> Self {
+        self.skip_fsync = skip;
+        self
     }
 
     fn path(&self, name: &str) -> io::Result<PathBuf> {
@@ -101,7 +115,7 @@ impl OsDisk {
 }
 
 #[derive(Debug)]
-struct OsFile(File);
+struct OsFile(File, bool);
 
 impl DiskFile for OsFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -111,6 +125,9 @@ impl DiskFile for OsFile {
         self.0.write_all_at(buf, offset)
     }
     fn sync(&self) -> io::Result<()> {
+        if self.1 {
+            return Ok(());
+        }
         self.0.sync_data()
     }
     fn len(&self) -> io::Result<u64> {
@@ -129,7 +146,7 @@ impl Disk for OsDisk {
             .create(true)
             .truncate(false)
             .open(self.path(name)?)?;
-        Ok(Arc::new(OsFile(file)))
+        Ok(Arc::new(OsFile(file, self.skip_fsync)))
     }
     fn exists(&self, name: &str) -> io::Result<bool> {
         self.path(name)?.try_exists()
@@ -154,6 +171,9 @@ impl Disk for OsDisk {
         Ok(names)
     }
     fn sync_dir(&self) -> io::Result<()> {
+        if self.skip_fsync {
+            return Ok(());
+        }
         File::open(&self.root)?.sync_all()
     }
 }

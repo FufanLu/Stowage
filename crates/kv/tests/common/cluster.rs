@@ -78,6 +78,9 @@ fn short_body(b: &stowage_raft::Body) -> String {
                 ),
                 Ok(Command::Push { kind, .. }) => format!("push {kind:?}"),
                 Ok(Command::Heartbeat { .. }) => "heartbeat".to_string(),
+                Ok(Command::Lock { key, .. }) => {
+                    format!("lock {:?}", String::from_utf8_lossy(&key))
+                }
                 Ok(Command::Split { key, new_id, .. }) => format!(
                     "split at {:?} → {}",
                     String::from_utf8_lossy(&key),

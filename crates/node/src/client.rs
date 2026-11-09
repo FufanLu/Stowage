@@ -284,11 +284,55 @@ impl KvClient {
         Err(ClientError::Exhausted(30, last_err))
     }
 
+    /// A linearizable read of the newest committed value. A transaction's
+    /// pending intent on the key blocks it: the read waits for that writer,
+    /// resolving the intent itself once the writer has committed or aborted (a
+    /// committed transaction's intents may outlive its acknowledgement
+    /// briefly, and skipping one would miss an acknowledged write).
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ClientError> {
-        match self.request(Request::Get { key: key.to_vec() }).await? {
-            Response::Value(v) => Ok(v),
-            other => Err(ClientError::Unexpected(other)),
+        use stowage_kv::mvcc::TxnStatus;
+        use stowage_kv::types::PushKind;
+        for attempt in 0..2_000u32 {
+            let txn = match self.request(Request::Get { key: key.to_vec() }).await? {
+                Response::Value(v) => return Ok(v),
+                Response::Conflict(txn) => txn,
+                other => return Err(ClientError::Unexpected(other)),
+            };
+            // Priority 0 never moves a live writer; it reports its state (and
+            // aborts it only if its heartbeats stopped).
+            let push = Request::Push {
+                pushee: txn.clone(),
+                kind: PushKind::Timestamp {
+                    ts: txn.write_ts,
+                    priority: 0,
+                },
+            };
+            match self.route(push, true).await? {
+                Response::Txn {
+                    status: TxnStatus::Pending,
+                    ..
+                } => {
+                    let ms = u64::from(attempt.min(10)) + 1;
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                Response::Txn {
+                    status, commit_ts, ..
+                } => {
+                    let resolve = Request::Resolve {
+                        key: key.to_vec(),
+                        txn_id: txn.id,
+                        commit: status == TxnStatus::Committed,
+                        commit_ts,
+                    };
+                    self.route(resolve, true).await?;
+                }
+                other => return Err(ClientError::Unexpected(other)),
+            }
         }
+        Err(ClientError::Exhausted(
+            2_000,
+            "a writer held the key".into(),
+        ))
     }
 
     pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), ClientError> {

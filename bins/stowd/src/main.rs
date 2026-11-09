@@ -53,6 +53,12 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     tick_ms: u64,
 
+    /// UNSAFE, benchmarks only: never fsync. Acknowledged writes then survive
+    /// a crash of the process but not a power loss of a majority of nodes
+    /// (the durability of a Dynamo-style store that relies on replication).
+    #[arg(long)]
+    unsafe_skip_fsync: bool,
+
     /// Log as JSON lines.
     #[arg(long)]
     log_json: bool,
@@ -204,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         peers,
         data_dir: args.data_dir,
         tick: Duration::from_millis(args.tick_ms),
+        unsafe_skip_fsync: args.unsafe_skip_fsync,
     })
     .await
     .context("node stopped")

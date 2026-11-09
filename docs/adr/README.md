@@ -12,6 +12,7 @@
 | [0008](0008-sql-layer.md) | The SQL layer: Postgres dialect, a Selinger optimizer, Arrow execution |
 | [0009](0009-cdc-and-documents.md) | Changefeeds, a DynamoDB-compatible API, and online schema changes |
 | [0010](0010-enterprise-operations.md) | Enterprise operations: security, backup, quotas, observability |
+| [0011](0011-contention-and-group-commit.md) | Contention, group commit, and the replica lifecycle under faults |
 
 New ADRs copy the shape of the existing ones: Context, Decision, Consequences,
 Alternatives considered.

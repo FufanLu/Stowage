@@ -41,6 +41,7 @@ impl TestCluster {
                 peers: peers.clone(),
                 data_dir: dir.join(format!("n{id}")),
                 tick: Duration::from_millis(10),
+                unsafe_skip_fsync: false,
             };
             std::fs::create_dir_all(&cfg.data_dir)?;
             tokio::spawn(async move {

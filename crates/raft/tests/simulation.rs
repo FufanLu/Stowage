@@ -419,16 +419,25 @@ fn minority_side_cannot_commit() {
         .copied()
         .filter(|i| !minority.contains(i))
         .collect();
-    let commit_before = w.sim.actor(old).unwrap().raft.commit();
+    // A commit needs three copies and the minority has two nodes, so the
+    // minority can commit only entries some majority node already had when the
+    // partition began. (It may still commit those: with async durability the
+    // leader counts its own copy once its fsync completes, which can be after
+    // the followers' acks arrived and the partition started.)
+    let majority_had = majority
+        .iter()
+        .map(|&i| w.sim.actor(i).unwrap().raft.last_index())
+        .max()
+        .unwrap();
     w.sim.partition(&minority, &majority);
     w.run(2 * SEC, true);
     // The old leader stepped down (check-quorum) and committed nothing new.
     let o = w.sim.actor(old).unwrap();
     assert!(!o.raft.is_leader(), "minority leader kept leading");
-    assert_eq!(
-        o.raft.commit(),
-        commit_before,
-        "minority side committed entries"
+    assert!(
+        o.raft.commit() <= majority_had,
+        "minority side committed entries no majority node had: commit {} > {majority_had}",
+        o.raft.commit()
     );
     let new = leader(&w.sim).unwrap();
     assert!(majority.contains(&new));

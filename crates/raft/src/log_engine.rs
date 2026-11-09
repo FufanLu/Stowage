@@ -253,9 +253,26 @@ impl LogBatch {
     /// Write and fsync. Safe to call from another thread, concurrently with new
     /// appends (which go into the engine's next buffer).
     pub fn write(&self) -> Result<()> {
+        self.write_unsynced()?;
+        self.sync()
+    }
+
+    /// Write without fsync. A background writer holding several batches writes
+    /// them all, then calls [`LogBatch::sync`] once per file: one fsync covers
+    /// every batch written to that file before it.
+    pub fn write_unsynced(&self) -> Result<()> {
         self.file.write_at(&self.bytes, self.offset)?;
+        Ok(())
+    }
+
+    pub fn sync(&self) -> Result<()> {
         self.file.sync()?;
         Ok(())
+    }
+
+    /// Whether `other` goes to the same file (no rewrite between them).
+    pub fn same_file(&self, other: &LogBatch) -> bool {
+        Arc::ptr_eq(&self.file, &other.file)
     }
 
     pub fn len(&self) -> usize {

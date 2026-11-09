@@ -44,6 +44,12 @@ pub enum Isolation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnOp {
     Get(Vec<u8>),
+    /// A locking read (`SELECT … FOR UPDATE`): takes the key's write intent now
+    /// and reads the newest committed value. For read-modify-write of a hot key:
+    /// conflicting transactions queue behind the intent instead of all reading,
+    /// then restarting when one of them commits first. Its result counts as a
+    /// `Get` in [`Reads`].
+    GetForUpdate(Vec<u8>),
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
     /// Up to `limit` live keys in `[start, end)` (`end` empty: unbounded), across
@@ -168,6 +174,13 @@ enum After {
 
 pub const MAX_RESTARTS: u32 = 30;
 
+/// Lost pushes a writer sits through before its priority may abort the holder
+/// of the intent in its way. Each comes after up to ~80 ms in the
+/// leaseholder's lock queue plus a 20 ms backoff, so this is about 100 ms:
+/// long enough for a queue on a hot key to take turns, short enough that
+/// waits stacking up do not starve other transactions into restarts.
+pub const WOUND_AFTER: u32 = 1;
+
 pub struct TxnCoord {
     id_seed: u128,
     isolation: Isolation,
@@ -187,6 +200,11 @@ pub struct TxnCoord {
     interactive: bool,
     retry_reason: &'static str,
     written: Vec<Vec<u8>>,
+    /// Keys whose intent a locking read took before anything else of ours
+    /// was there: their newest committed version is the one we read, and
+    /// nobody can commit above it before us, so the commit-time check for a
+    /// newer version in (read_ts, write_ts] does not apply to them.
+    locked: Vec<Vec<u8>>,
     skip: Vec<u128>,
     current: Option<TxnOp>,
     ops_done: usize,
@@ -211,6 +229,10 @@ impl std::fmt::Debug for TxnCoord {
             .field("write_ts", &self.meta.write_ts)
             .field("phase", &self.phase)
             .field("restarts", &self.restarts)
+            .field("current", &self.current)
+            .field("live", &self.live)
+            .field("ops_done", &self.ops_done)
+            .field("interactive", &self.interactive)
             .finish_non_exhaustive()
     }
 }
@@ -247,6 +269,7 @@ impl TxnCoord {
             interactive: false,
             retry_reason: "",
             written: Vec::new(),
+            locked: Vec::new(),
             skip: Vec::new(),
             current: None,
             ops_done: 0,
@@ -351,6 +374,16 @@ impl TxnCoord {
                     skip: self.skip.clone(),
                 });
             }
+            Some(TxnOp::GetForUpdate(key)) => {
+                if !self.has_anchor {
+                    self.meta.anchor = key.clone();
+                    self.has_anchor = true;
+                }
+                self.send(Request::TxnLock {
+                    key,
+                    txn: self.meta.clone(),
+                });
+            }
             Some(TxnOp::Put(key, value)) => self.issue_put(key, Some(value)),
             Some(TxnOp::Delete(key)) => self.issue_put(key, None),
             Some(TxnOp::Scan { start, end, limit }) => {
@@ -401,7 +434,12 @@ impl TxnCoord {
     }
 
     fn start_refresh(&mut self) {
-        let mut keys = self.written.clone();
+        let mut keys: Vec<Vec<u8>> = self
+            .written
+            .iter()
+            .filter(|k| !self.locked.contains(k))
+            .cloned()
+            .collect();
         if self.isolation == Isolation::Serializable {
             for k in &self.read_keys {
                 if !keys.contains(k) {
@@ -560,6 +598,7 @@ impl TxnCoord {
         self.scan_from.clear();
         self.scan_rows.clear();
         self.written.clear();
+        self.locked.clear();
         self.skip.clear();
         self.current = None;
         self.ops_done = 0;
@@ -628,7 +667,7 @@ impl TxnCoord {
                         // We lost the conflict: wait for the winner.
                         self.backoffs += 1;
                         if self.backoffs > 50 {
-                            self.restart();
+                            self.restart_because("waited too long for a conflicting transaction");
                         } else {
                             self.phase = Phase::Backoff {
                                 until_wall: now.wall + 20_000_000,
@@ -696,7 +735,7 @@ impl TxnCoord {
                 Response::Txn {
                     status: TxnStatus::Aborted,
                     ..
-                } => self.restart(),
+                } => self.restart_because("aborted by a conflicting transaction before commit"),
                 Response::Txn {
                     status: TxnStatus::Pending,
                     min_commit_ts,
@@ -729,6 +768,22 @@ impl TxnCoord {
                 self.reads.push(v.clone());
                 self.read_keys.push(key);
                 self.op_done(OpResult::Value(v));
+            }
+            (Some(TxnOp::GetForUpdate(key)), Response::Locked { ts, value }) => {
+                // Not a snapshot read: the intent keeps the key unchanged up to
+                // our commit, so it is not refreshed (not in `read_keys`).
+                self.meta.write_ts = self.meta.write_ts.max(ts);
+                if !self.written.contains(&key) {
+                    self.written.push(key.clone());
+                    self.locked.push(key);
+                }
+                self.reads.push(value.clone());
+                self.op_done(OpResult::Value(value));
+            }
+            (Some(TxnOp::GetForUpdate(_)), Response::WriteTooOld(ts)) => {
+                // Nothing read yet from this key: just lock above the newer version.
+                self.meta.write_ts = self.meta.write_ts.max(ts.next());
+                self.issue_current();
             }
             (Some(TxnOp::Put(key, _) | TxnOp::Delete(key)), Response::Written(ts)) => {
                 self.meta.write_ts = self.meta.write_ts.max(ts);
@@ -796,7 +851,10 @@ impl TxnCoord {
             }
             (Some(op), Response::Conflict(other)) => {
                 let key = match &op {
-                    TxnOp::Get(k) | TxnOp::Put(k, _) | TxnOp::Delete(k) => k.clone(),
+                    TxnOp::Get(k)
+                    | TxnOp::GetForUpdate(k)
+                    | TxnOp::Put(k, _)
+                    | TxnOp::Delete(k) => k.clone(),
                     TxnOp::Scan { start, .. } => start.clone(),
                 };
                 let kind = match op {
@@ -804,8 +862,19 @@ impl TxnCoord {
                         ts: self.read_ts,
                         priority: self.meta.priority,
                     },
+                    // Wait first: only after WOUND_AFTER lost rounds may our
+                    // priority abort the holder. A queue on a hot key then
+                    // drains in turn instead of aborting whoever holds the
+                    // lock, while a deadlock (each waiting for the other) is
+                    // still broken by priority after ~100 ms. Priority 0
+                    // never wins; the push still reports a finished or
+                    // abandoned holder.
                     _ => PushKind::Abort {
-                        priority: self.meta.priority,
+                        priority: if self.backoffs >= WOUND_AFTER {
+                            self.meta.priority
+                        } else {
+                            0
+                        },
                     },
                 };
                 self.phase = Phase::Pushing {
